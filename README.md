@@ -1,6 +1,6 @@
 # Evaluación de modelos CNN y LSTM mediante representaciones espectrales para la detección de audios sintéticos
 
-**Autoras:** Cortés Carrisoza, Edna Samantha · García Vázquez, Arantza
+**Autoras:** Samantha Cortés · Arantza García
 
 Este repositorio contiene el código y la documentación del proyecto de evaluación comparativa de modelos CNN y LSTM aplicados a espectrogramas de audio para distinguir entre habla genuina y habla generada o manipulada mediante inteligencia artificial (audios *deepfake*).
 
