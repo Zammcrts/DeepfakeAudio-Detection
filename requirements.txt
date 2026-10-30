@@ -1,0 +1,13 @@
+# training ---
+torch>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+matplotlib>=3.7
+
+# oreprocesamiento de audio y analisis
+librosa>=0.10
+pandas>=2.0
+seaborn>=0.12
+
+#notebooks ---
+jupyter
