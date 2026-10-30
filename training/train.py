@@ -96,10 +96,11 @@ def fit(model, L_tr, L_va, y_tr, device, epochs, lr, patience, ckpt, tag):
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=2)
     best, bad, hist = 1e9, 0, []
     for ep in range(1, epochs + 1):
+        t0 = time.perf_counter()
         tl = run_epoch(model, L_tr, loss_fn, device, opt)
         vl = run_epoch(model, L_va, loss_fn, device)
         sched.step(vl); hist.append((tl, vl))
-        print(f"[{tag}] ep {ep:02d}  train {tl:.4f}  val {vl:.4f}")
+        print(f"[{tag}] ep {ep:02d}  train {tl:.4f}  val {vl:.4f}  ({time.perf_counter() - t0:.0f}s)", flush=True)
         if vl < best:
             best, bad = vl, 0; torch.save(model.state_dict(), ckpt)
         else:
@@ -197,6 +198,8 @@ def main():
     ap.add_argument("--lr_ft", type=float, default=1e-4)
     ap.add_argument("--patience", type=int, default=7)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="procesos para leer datos. 0 = en el proceso principal (más estable en Windows)")
     a = ap.parse_args()
 
     torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -215,7 +218,9 @@ def main():
     print(f"multi: train={len(mtr_p)} val={len(mva_p)} | español: train={len(etr_p)} val={len(eva_p)} test={len(ete_p)}"
           f" | n_mels={n_mels} frames={a.n_frames} | {device}")
 
-    mk = lambda p, l, tr: DataLoader(SpecDataset(p, l, a.n_frames, tr), batch_size=a.batch, shuffle=tr, num_workers=2)
+    mk = lambda p, l, tr: DataLoader(SpecDataset(p, l, a.n_frames, tr), batch_size=a.batch, shuffle=tr,
+                                     num_workers=a.workers, persistent_workers=a.workers > 0,
+                                     pin_memory=(device == "cuda"))
     L_mtr, L_mva = mk(mtr_p, mtr_y, True), mk(mva_p, mva_y, False)
     L_etr, L_eva, L_ete = mk(etr_p, etr_y, True), mk(eva_p, eva_y, False), mk(ete_p, ete_y, False)
 

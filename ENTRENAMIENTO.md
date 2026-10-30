@@ -19,13 +19,13 @@ Este documento explica, paso a paso y con lenguaje técnico, **cómo se entrenan
 
 ```
 ETAPA 1  Preentrenamiento
-         ~16k audios multilingües (9069 reales / 7184 fake)
+         ~16.5k audios multilingües (9,569 reales / 6,977 fake)
          La red aprende, desde cero, qué distingue lo real de lo fake.
                          │
                          ▼
 ETAPA 2  Adaptación al español (fine-tuning)
          Se quita la última capa, se pone una nueva y se reajusta
-         con los audios en español (≈502 reales / ≈501 fake).
+         con los audios en español (502 reales / 461 fake).
                          │
                          ▼
 EVALUACIÓN  Siempre sobre el mismo conjunto de prueba en español,
@@ -52,10 +52,10 @@ Las voces sintéticas suelen dejar rastros en esta representación (texturas dem
 
 Las redes necesitan entradas de tamaño fijo, pero los audios duran distinto. Cada espectrograma pasa por estos pasos:
 
-1. **Ajuste de longitud a 128 frames** (`--n_frames`).
+1. **Ajuste de longitud a `n_frames` frames** (`--n_frames`; 128 por defecto, 431 en el entrenamiento final).
    - Si es más largo: se **recorta**. En entrenamiento el recorte empieza en una posición aleatoria (cada época la red ve un fragmento distinto, lo que actúa como aumento de datos). En validación y prueba siempre se toma el inicio, para que los resultados sean deterministas.
    - Si es más corto: se **rellena** con el valor mínimo del espectrograma, que equivale aproximadamente a silencio.
-   - Referencia: con 16 kHz y `hop_length = 512`, 128 frames ≈ 4.1 s. El valor real depende de los parámetros con los que se generaron los `.npy`.
+   - En este proyecto **todos los espectrogramas tienen 431 frames**, que equivalen a unos 10 s (con 22,05 kHz y `hop_length = 512`, lo más probable; confirmar con los parámetros usados al generarlos). El valor por defecto (128 frames) usaría solo ≈ 3 s de cada clip, por lo que el entrenamiento final se ejecuta con `--n_frames 431`, que aprovecha el clip completo. La interfaz debe convertir cualquier audio a esa misma duración y parámetros.
 
 2. **Normalización por muestra (z-score):** `s = (s − media) / (desviación + 1e-8)`. Elimina diferencias de volumen o ganancia entre grabaciones, de modo que el modelo se fije en la *forma* del espectro y no en lo fuerte que se grabó. **La misma normalización debe aplicarse en la interfaz**; si no, las predicciones no son comparables con las del entrenamiento.
 
@@ -73,17 +73,28 @@ Todas las particiones son **estratificadas** (conservan la proporción real/fake
 
 | Conjunto | Origen | Proporción | Tamaño aprox. | Uso |
 |---|---|---|---|---|
-| Multilingüe · entrenamiento | datos multilingües | 85 % | ≈ 13,800 | Etapa 1 |
-| Multilingüe · validación | datos multilingües | 15 % | ≈ 2,440 | Etapa 1: monitoreo y selección |
-| Español · entrenamiento | español | 70 % | ≈ 702 | Etapa 2 y línea base |
-| Español · validación | español | 15 % | ≈ 150 | Etapa 2: monitoreo, selección y umbral |
-| Español · **prueba** | español | 15 % | ≈ 151 | **Solo evaluación final** |
+| Multilingüe · entrenamiento | datos multilingües | 85 % | ≈ 14,060 | Etapa 1 |
+| Multilingüe · validación | datos multilingües | 15 % | ≈ 2,480 | Etapa 1: monitoreo y selección |
+| Español · entrenamiento | español | 70 % | ≈ 674 | Etapa 2 y línea base |
+| Español · validación | español | 15 % | ≈ 144 | Etapa 2: monitoreo, selección y umbral |
+| Español · **prueba** | español | 15 % | ≈ 145 | **Solo evaluación final** |
 
 **Para qué sirve cada uno:**
 
 - **Entrenamiento:** los datos con los que la red ajusta sus pesos.
 - **Validación:** datos que la red no usa para ajustar pesos, pero que sirven para decidir *cuándo parar*, *qué versión del modelo conservar* y *qué umbral usar*.
 - **Prueba:** datos que **nunca** influyen en ninguna decisión. Dan la estimación honesta de cómo se comportará el modelo con audios nuevos.
+
+### 3.1 Verificación y limpieza de los datos
+
+Antes de entrenar se revisaron los datos con `training/verificar_datos.py`, que compara el contenido de cada archivo (huella MD5), y se limpiaron con `training/deduplicar_datos.py`:
+
+- Todos los espectrogramas tienen 128 bandas Mel × 431 frames.
+- Se encontraron y apartaron **duplicados exactos**: 246 en el conjunto multilingüe (40 reales y 206 fake, p. ej. copias con sufijo `(1)`) y 40 fake en español (pares con el mismo contenido bajo dos nombres). Se movieron a carpetas `*_duplicados`, sin borrarlos.
+- No hay archivos compartidos entre el conjunto multilingüe y el de español, ni archivos con la misma huella en clases distintas.
+- Conteos finales: multilingüe **9,569 reales y 6,977 fake** (16,546); español **502 reales y 461 fake** (963).
+
+Si hay duplicados repartidos entre entrenamiento y prueba, la evaluación sale inflada, por eso este paso es previo al entrenamiento. La verificación solo detecta copias exactas, no un mismo audio exportado de otra forma ni un mismo hablante.
 
 ---
 
@@ -116,7 +127,7 @@ La red trata el espectrograma como una imagen de **1 canal**: `(batch, 1, 128, 1
 | `AdaptiveAvgPool2d(1)` | `(B, 256)` |
 | Cabeza: `Dropout(0.4)` → `Linear(256→64)` → `ReLU` → `Dropout(0.4)` → `Linear(64→2)` | `(B, 2)` |
 
-Las primeras capas detectan patrones simples (líneas, bordes) y las profundas los combinan en patrones complejos. El **promedio global** resume cada mapa de características en un solo número, lo que además hace que la red funcione con cualquier duración de entrada.
+Las primeras capas detectan patrones simples (líneas, bordes) y las profundas los combinan en patrones complejos. El **promedio global** resume cada mapa de características en un solo número, lo que además hace que la red funcione con cualquier duración de entrada. Las formas de la tabla corresponden a 128 frames; con 431 frames el último mapa de la CNN es `(B, 256, 8, 26)` y la secuencia de la LSTM pasa de 128 a 431 pasos.
 
 ### 4.2 LSTM (≈ 692,700 parámetros)
 
@@ -156,10 +167,10 @@ Una pasada completa por todos los datos de entrenamiento es una **época**. Se r
 
 `CrossEntropyLoss` mide la distancia entre las probabilidades predichas y la etiqueta verdadera: penaliza fuertemente cuando el modelo está muy seguro y se equivoca.
 
-**Pesos por clase.** Hay más audios reales que fake (9069 vs 7184). Sin corrección, la red tendería a favorecer la clase mayoritaria. Se pondera cada clase de forma inversamente proporcional a su frecuencia:
+**Pesos por clase.** Hay más audios reales que fake (9,569 vs 6,977). Sin corrección, la red tendería a favorecer la clase mayoritaria. Se pondera cada clase de forma inversamente proporcional a su frecuencia:
 
 ```
-peso_c = N / (2 · N_c)      →   real ≈ 0.90,   fake ≈ 1.13   (etapa 1)
+peso_c = N / (2 · N_c)      →   real ≈ 0.86,   fake ≈ 1.19   (etapa 1)
 ```
 
 Así, equivocarse con un audio fake cuesta algo más que equivocarse con uno real. Los pesos se recalculan con las etiquetas de cada etapa.
@@ -194,7 +205,7 @@ Así, equivocarse con un audio fake cuesta algo más que equivocarse con uno rea
 **Procedimiento (para cada modelo):**
 
 1. Se crea la red con pesos aleatorios.
-2. Se entrena con la partición multilingüe de entrenamiento (≈ 13,800 audios), con pérdida ponderada, AdamW (lr 1e-3), SpecAugment y recorte aleatorio.
+2. Se entrena con la partición multilingüe de entrenamiento (≈ 14,060 audios), con pérdida ponderada, AdamW (lr 1e-3), SpecAugment y recorte aleatorio.
 3. Tras cada época se mide la pérdida en la validación multilingüe; se aplican scheduler, early stopping y guardado del mejor modelo.
 4. Resultado: `cnn_pre.pt` / `lstm_pre.pt`.
 
@@ -206,7 +217,7 @@ En este punto se evalúa el modelo en el test en español **sin haberlo visto nu
 
 ### 8.1 Idea
 
-Una red ya preentrenada ha aprendido características útiles (en la CNN, filtros que detectan texturas; en la LSTM, patrones temporales). Reaprender todo con solo ≈ 700 audios en español provocaría sobreajuste. Lo eficiente es **reutilizar** lo aprendido y ajustar solo lo necesario.
+Una red ya preentrenada ha aprendido características útiles (en la CNN, filtros que detectan texturas; en la LSTM, patrones temporales). Reaprender todo con solo ≈ 670 audios en español provocaría sobreajuste. Lo eficiente es **reutilizar** lo aprendido y ajustar solo lo necesario.
 
 ### 8.2 Reemplazo de la última capa
 
@@ -286,7 +297,8 @@ El **AUC** es especialmente útil para comparar modelos porque no depende del um
 
 ```bash
 pip install -r requirements.txt
-python train.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados
+python training/verificar_datos.py --multi_dir datos/multilingue --es_dir datos/espanol
+python training/train.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados --n_frames 431
 ```
 
 Estructura de datos esperada:
@@ -297,14 +309,15 @@ datos/
 └── espanol/{real,fake}/*.npy
 ```
 
-Se usa GPU automáticamente si está disponible; si no, CPU. Los hiperparámetros se pueden cambiar con argumentos (`--epochs_pre`, `--lr_ft`, `--batch`, `--seed`, etc.).
+Se usa GPU automáticamente si está disponible; si no, CPU. Los hiperparámetros se pueden cambiar con argumentos (`--n_frames`, `--epochs_pre`, `--lr_ft`, `--batch`, `--workers`, `--seed`, etc.).
 
 ---
 
 ## 12. Limitaciones a tener presentes
 
-- **Tamaño del conjunto de prueba.** Con ≈ 151 audios, el intervalo de confianza al 95 % de una exactitud de 0.90 es de aproximadamente ±4.8 puntos. Diferencias de pocos puntos entre CNN y LSTM **pueden no ser significativas**. Conviene repetir el experimento con varias semillas y reportar media y desviación estándar.
+- **Tamaño del conjunto de prueba.** Con ≈ 145 audios, el intervalo de confianza al 95 % de una exactitud de 0.90 es de aproximadamente ±4.9 puntos. Diferencias de pocos puntos entre CNN y LSTM **pueden no ser significativas**. Conviene repetir el experimento con varias semillas y reportar media y desviación estándar.
 - **Fuga por hablante.** Las particiones son aleatorias por audio. Si un mismo hablante aparece en entrenamiento y en validación o prueba, los resultados pueden ser optimistas porque el modelo reconoce a la persona y no la autenticidad. Lo ideal es separar por hablante cuando se tenga esa información.
+- **Voz de los fakes en español.** Los nombres de los archivos sugieren que los fake en español son clones de una voz concreta. Si los reales provienen de otras personas, el modelo podría aprender a reconocer esa voz y no señales de síntesis. Debe confirmarse el origen de los reales y declararse como limitación.
 - **Tipos de síntesis.** El modelo solo conoce los métodos de generación presentes en los datos. Con técnicas de síntesis nuevas el desempeño puede caer.
 - **Probabilidades sobreconfiadas.** Las redes tienden a producir probabilidades extremas (p. ej. 98 %) que no equivalen a certeza real. Los porcentajes de la interfaz deben interpretarse como confianza del modelo, no como probabilidad calibrada.
 - **Coherencia con la interfaz.** El preprocesamiento (parámetros del espectrograma, longitud de 128 frames y normalización z-score) debe ser idéntico al del entrenamiento.

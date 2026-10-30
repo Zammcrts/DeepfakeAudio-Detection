@@ -1,6 +1,6 @@
 # Evaluación de modelos CNN y LSTM mediante representaciones espectrales para la detección de audios sintéticos
 
-**Autoras:** Samantha Cortés · Arantza García
+**Autoras:** Cortés Carrisoza, Edna Samantha · García Vázquez, Arantza
 
 Este repositorio contiene el código y la documentación del proyecto de evaluación comparativa de modelos CNN y LSTM aplicados a espectrogramas de audio para distinguir entre habla genuina y habla generada o manipulada mediante inteligencia artificial (audios *deepfake*).
 
@@ -216,10 +216,10 @@ Esta sección describe cómo se concretó el protocolo en el código.
 
 | Conjunto | Reales | Fake | Uso |
 |---|---|---|---|
-| Multilingüe (varios idiomas) | 9,069 | 7,184 | Etapa 1: preentrenamiento |
-| Español | 502 | 501 | Etapa 2: adaptación, y evaluación final |
+| Multilingüe (varios idiomas) | 9,569 | 6,977 | Etapa 1: preentrenamiento |
+| Español | 502 | 461 | Etapa 2: adaptación, y evaluación final |
 
-Los datos no se versionan en el repositorio por su tamaño (ver `.gitignore`).
+Los datos no se versionan en el repositorio por su tamaño (ver `.gitignore`). Cada espectrograma tiene 128 bandas Mel × 431 frames (≈ 10 s). Antes de entrenar se verificaron los datos y se apartaron los duplicados exactos (246 en el conjunto multilingüe y 40 en español) con `verificar_datos.py` y `deduplicar_datos.py`; los conteos de la tabla son los finales.
 
 **Modelos** (`training/models.py`)
 
@@ -250,6 +250,8 @@ El detalle completo del entrenamiento, los hiperparámetros y las métricas est�
 └── training/
     ├── models.py            # arquitecturas CNN y LSTM
     ├── train.py             # entrenamiento en dos etapas y evaluación
+    ├── verificar_datos.py   # revisa conteos, formas, duplicados y fugas entre conjuntos
+    ├── deduplicar_datos.py  # aparta duplicados exactos (simulacro por defecto)
     └── ENTRENAMIENTO.md     # explicación detallada del entrenamiento
 ```
 
@@ -267,7 +269,8 @@ datos/
 
 ```bash
 pip install -r requirements.txt
-python training/train.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados
+python training/verificar_datos.py --multi_dir datos/multilingue --es_dir datos/espanol
+python training/train.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados --n_frames 431
 ```
 
 El script usa GPU si está disponible. Genera en `resultados/`: los modelos entrenados (`.pt`), `metricas.json`, `registro_pruebas.csv` (matriz de registro del punto 4.2), `splits.json`, y las figuras `roc.png`, `matrices_confusion.png` y `perdidas.png`.

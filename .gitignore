@@ -1,3 +1,16 @@
 .venv
 .vscode
 datos/
+
+__pycache__/
+*.pyc
+.venv/
+datos/
+datos_duplicados/
+*_duplicados/
+resultados/
+prueba/
+prueba_cpu/
+*.pt
+*.npy
+*.log
