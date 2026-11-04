@@ -87,13 +87,13 @@ def run_epoch(model, loader, loss_fn, device, opt=None):
     return total / n
 
 
-def fit(model, L_tr, L_va, y_tr, device, epochs, lr, patience, ckpt, tag):
+def fit(model, L_tr, L_va, y_tr, device, epochs, lr, patience, ckpt, tag, lr_patience=5):
     """Entrena con early stopping sobre la pérdida de validación y deja cargado el mejor modelo."""
     w = torch.tensor(len(y_tr) / (2 * np.bincount(y_tr, minlength=2)), dtype=torch.float32, device=device)
     loss_fn = nn.CrossEntropyLoss(weight=w)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=2)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=lr_patience)
     best, bad, hist = 1e9, 0, []
     for ep in range(1, epochs + 1):
         t0 = time.perf_counter()
@@ -190,13 +190,16 @@ def main():
     ap.add_argument("--out", default="resultados")
     ap.add_argument("--n_frames", type=int, default=128)
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--epochs_pre", type=int, default=40)
+    ap.add_argument("--epochs_pre", type=int, default=100, help="etapa 1 y línea base (tope)")
     ap.add_argument("--lr_pre", type=float, default=1e-3)
-    ap.add_argument("--epochs_head", type=int, default=10, help="afinado A: solo la capa nueva")
-    ap.add_argument("--epochs_ft", type=int, default=30, help="afinado B: toda la red")
+    ap.add_argument("--epochs_head", type=int, default=20, help="afinado 2a: cabeza (tope)")
+    ap.add_argument("--epochs_ft", type=int, default=100, help="afinado 2b: toda la red (tope)")
     ap.add_argument("--lr_head", type=float, default=1e-3)
     ap.add_argument("--lr_ft", type=float, default=1e-4)
-    ap.add_argument("--patience", type=int, default=7)
+    ap.add_argument("--patience", type=int, default=15,
+                    help="early stopping: épocas sin mejorar la validación. Igualarlo a las épocas lo desactiva")
+    ap.add_argument("--lr_patience", type=int, default=5,
+                    help="ReduceLROnPlateau: épocas sin mejorar antes de bajar el lr a la mitad (< patience)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=0,
                     help="procesos para leer datos. 0 = en el proceso principal (más estable en Windows)")
@@ -232,7 +235,7 @@ def main():
         print(f"\n=== {name.upper()} · ETAPA 1: preentrenamiento multilingüe ===")
         model = build(name, n_mels).to(device)
         history[name]["pre"] = fit(model, L_mtr, L_mva, mtr_y, device, a.epochs_pre, a.lr_pre, a.patience,
-                                   out / f"{name}_pre.pt", f"{name} pre")
+                                   out / f"{name}_pre.pt", f"{name} pre", a.lr_patience)
         yv, pv, _ = predict(model, L_mva, device)
         results[name]["0_multilingue_val"] = {"auc": roc_auc_score(yv, pv),
                                               "accuracy": accuracy_score(yv, pv >= .5)}
@@ -244,10 +247,10 @@ def main():
         replace_last_layer(model); model.to(device)
         set_backbone_trainable(model, False)                      # 2a: solo aprende la capa nueva
         fit(model, L_etr, L_eva, etr_y, device, a.epochs_head, a.lr_head, a.patience,
-            out / f"{name}_head.pt", f"{name} capa")
+            out / f"{name}_head.pt", f"{name} capa", a.lr_patience)
         set_backbone_trainable(model, True)                       # 2b: se afina toda la red con lr bajo
         history[name]["ft"] = fit(model, L_etr, L_eva, etr_y, device, a.epochs_ft, a.lr_ft, a.patience,
-                                  out / f"{name}.pt", f"{name} afinado")
+                                  out / f"{name}.pt", f"{name} afinado", a.lr_patience)
         results[name]["B_preentrenado_y_afinado_es"], preds[name]["B"] = evaluate(model, L_eva, L_ete, device)
         rows += registro(model, ete_p, ete_y, a.n_frames, device, name, "B_afinado_es")
 
@@ -255,7 +258,7 @@ def main():
         print(f"\n=== {name.upper()} · LÍNEA BASE: solo español ===")
         base = build(name, n_mels).to(device)
         fit(base, L_etr, L_eva, etr_y, device, a.epochs_pre, a.lr_pre, a.patience, out / f"{name}_solo_es.pt",
-            f"{name} solo-es")
+            f"{name} solo-es", a.lr_patience)
         results[name]["C_solo_espanol"], preds[name]["C"] = evaluate(base, L_eva, L_ete, device)
         rows += registro(base, ete_p, ete_y, a.n_frames, device, name, "C_solo_es")
         results[name]["params"] = sum(p.numel() for p in model.parameters())
