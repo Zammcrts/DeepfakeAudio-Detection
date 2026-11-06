@@ -14,3 +14,4 @@ prueba_cpu/
 *.pt
 *.npy
 *.log
+resultados_cv/

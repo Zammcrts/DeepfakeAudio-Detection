@@ -16,7 +16,7 @@ Estructura de datos (.npy = espectrograma (n_mels, frames)):
 Uso:
     python train.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados
 """
-import argparse, csv, json, time
+import argparse, csv, json, shutil, time
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from models import build
-from preprocesamiento import acondicionar, normalizar
+from preprocesamiento import acondicionar, normalizar, perturbar_canal
 from grupos_es import grupo
 
 LABELS = {"real": 0, "fake": 1}
@@ -52,15 +52,23 @@ class SpecDataset(Dataset):
     """Carga .npy, lo acondiciona a n_frames y normaliza por muestra con preprocesamiento.py,
     el mismo código que usa la interfaz en inferencia."""
 
-    def __init__(self, paths, labels, n_frames, train=False, relleno="repetir"):
+    def __init__(self, paths, labels, n_frames, train=False, relleno="repetir", canal=0.0, estres=False):
+        """canal: probabilidad de perturbar el 'canal' en entrenamiento (ver preprocesamiento.perturbar_canal).
+        estres: aplica SIEMPRE una perturbación fija por audio (prueba de robustez, sin aleatoriedad entre corridas)."""
         self.paths, self.labels, self.n_frames, self.train, self.relleno = paths, labels, n_frames, train, relleno
+        self.canal, self.estres = canal, estres
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, i):
         s = np.load(self.paths[i]).astype(np.float32)
-        s = normalizar(acondicionar(s, self.n_frames, self.relleno, aleatorio=self.train))
+        s = acondicionar(s, self.n_frames, self.relleno, aleatorio=self.train)
+        if self.estres:
+            s = perturbar_canal(s, np.random.default_rng(1000 + i), p=1.0)
+        elif self.train and self.canal > 0:
+            s = perturbar_canal(s, None, p=self.canal)
+        s = normalizar(s)
         if self.train:  # SpecAugment simple
             f = np.random.randint(0, 12); f0 = np.random.randint(0, s.shape[0] - f)
             t = np.random.randint(0, 20); t0 = np.random.randint(0, s.shape[1] - t)
@@ -69,33 +77,45 @@ class SpecDataset(Dataset):
 
 
 # ----------------------------------------------------------------------------- entrenamiento
-def run_epoch(model, loader, loss_fn, device, opt=None):
+def run_epoch(model, loader, loss_fn, device, opt=None, scaler=None):
+    """scaler != None activa precisión mixta (AMP) en entrenamiento: más rápido en GPU, mismos resultados."""
     model.train(opt is not None)
     total, n = 0.0, 0
     with torch.set_grad_enabled(opt is not None):
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            loss = loss_fn(model(x), y)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=scaler is not None):
+                out = model(x)
+            loss = loss_fn(out.float(), y)
             if opt:
-                opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step()
+                opt.zero_grad()
+                if scaler is not None:
+                    scaler.scale(loss).backward(); scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    scaler.step(opt); scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    opt.step()
             total += loss.item() * len(y); n += len(y)
     return total / n
 
 
-def fit(model, L_tr, L_va, y_tr, device, epochs, lr, patience, ckpt, tag, lr_patience=5):
-    """Entrena con early stopping sobre la pérdida de validación y deja cargado el mejor modelo."""
+def fit(model, L_tr, L_va, y_tr, device, epochs, lr, patience, ckpt, tag, lr_patience=5, smooth=0.0, amp=False):
+    """Entrena con early stopping sobre la pérdida de validación y deja cargado el mejor modelo.
+    smooth: label smoothing en la pérdida de entrenamiento (la de validación es siempre la normal)."""
     w = torch.tensor(len(y_tr) / (2 * np.bincount(y_tr, minlength=2)), dtype=torch.float32, device=device)
-    loss_fn = nn.CrossEntropyLoss(weight=w)
+    loss_fn = nn.CrossEntropyLoss(weight=w, label_smoothing=smooth)
+    loss_val = nn.CrossEntropyLoss(weight=w)
+    scaler = torch.amp.GradScaler("cuda") if (amp and device == "cuda") else None
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=lr_patience)
     best, bad, hist = 1e9, 0, []
     for ep in range(1, epochs + 1):
         t0 = time.perf_counter()
-        tl = run_epoch(model, L_tr, loss_fn, device, opt)
-        vl = run_epoch(model, L_va, loss_fn, device)
+        tl = run_epoch(model, L_tr, loss_fn, device, opt, scaler)
+        vl = run_epoch(model, L_va, loss_val, device)
         sched.step(vl); hist.append((tl, vl))
         print(f"[{tag}] ep {ep:02d}  train {tl:.4f}  val {vl:.4f}  ({time.perf_counter() - t0:.0f}s)", flush=True)
         if vl < best:
@@ -132,6 +152,30 @@ def predict(model, loader, device):
     for x, y in loader:
         probs.append(torch.softmax(model(x.to(device)), 1)[:, 1].cpu().numpy()); ys.append(y.numpy())
     return np.concatenate(ys), np.concatenate(probs), time.perf_counter() - t0
+
+
+@torch.no_grad()
+def logits_de(model, loader, device):
+    model.eval()
+    zs, ys = [], []
+    for x, y in loader:
+        zs.append(model(x.to(device)).float().cpu().numpy()); ys.append(y.numpy())
+    return np.concatenate(zs), np.concatenate(ys)
+
+
+def ajustar_temperatura(z, y):
+    """Temperature scaling: busca T que minimiza la entropía cruzada de softmax(z / T) en validación.
+    Solo se permite SUAVIZAR (T >= 1): con una validación casi perfecta el ajuste libre pediría T < 1
+    (aún más seguridad), que es justo lo contrario de lo que se quiere."""
+    d = (z[:, 1] - z[:, 0]).astype(np.float64)
+    ys = y.astype(np.float64)
+    mejor, mejor_T = 1e18, 1.0
+    for T in np.geomspace(1.0, 20.0, 80):
+        s = d / T
+        nll = np.mean(np.logaddexp(0, s) - ys * s)       # -log p(y)
+        if nll < mejor:
+            mejor, mejor_T = nll, float(T)
+    return mejor_T
 
 
 def metrics(y, p, elapsed, thr=0.5):
@@ -173,7 +217,7 @@ def diferencia_auc(y, p1, p2, n_boot=1000, seed=0):
             "ic95": [float(np.percentile(d, 2.5)), float(np.percentile(d, 97.5))]}
 
 
-def evaluate(model, L_va, L_te, device, n_boot=1000):
+def evaluate(model, L_va, L_te, device, n_boot=1000, L_x=None):
     """Métricas en test a 0.5 y con el umbral elegido en validación en español (nunca en test)."""
     yv, pv, _ = predict(model, L_va, device)
     fpr, tpr, thr = roc_curve(yv, pv)
@@ -183,18 +227,25 @@ def evaluate(model, L_va, L_te, device, n_boot=1000):
     if n_boot:
         r["test@0.5"]["ic95"] = intervalos(yt, pt, 0.5, n_boot)
         r["test@umbral_val"]["ic95"] = intervalos(yt, pt, thr_v, n_boot)
+    if L_x is not None:   # mismo test con otro "canal": si el modelo se apoya en la grabación, aquí se cae
+        yx, px, _ = predict(model, L_x, device)
+        r["test_estres"] = {"accuracy": accuracy_score(yx, px >= .5), "auc": roc_auc_score(yx, px)}
     return r, (yt, pt)
 
 
-def evaluate_todo(model, L_all, device, n_boot=1000):
+def evaluate_todo(model, L_all, device, n_boot=1000, L_x=None):
     """Para la condición A (nunca vio español): todo el español sirve de prueba, no solo el 15 %.
     Más audios = márgenes de error más estrechos."""
     y, p, el = predict(model, L_all, device)
     m = metrics(y, p, el); m["ic95"] = intervalos(y, p, 0.5, n_boot) if n_boot else None
-    return {"todo_espanol@0.5": m}, (y, p)
+    r = {"todo_espanol@0.5": m}
+    if L_x is not None:
+        yx, px, _ = predict(model, L_x, device)
+        r["test_estres"] = {"accuracy": accuracy_score(yx, px >= .5), "auc": roc_auc_score(yx, px)}
+    return r, (y, p)
 
 
-def partir_espanol(paths, labels, por_grupo, seed):
+def partir_espanol(paths, labels, por_grupo, seed, fold=0):
     """70/15/15 estratificado al azar, o (por_grupo) separado por hablante/voz: un mismo grupo nunca queda
     en entrenamiento y prueba a la vez. Devuelve (train, val, test) como índices."""
     idx = np.arange(len(paths))
@@ -205,8 +256,9 @@ def partir_espanol(paths, labels, por_grupo, seed):
     from sklearn.model_selection import StratifiedGroupKFold
     g = np.array([grupo(Path(p).name) for p in paths])   # persona real y su clon IA: mismo grupo
     folds = [te for _, te in StratifiedGroupKFold(n_splits=7, shuffle=True, random_state=seed).split(idx, labels, g)]
-    te, va = folds[0], folds[1]
-    tr = np.concatenate(folds[2:])
+    k = fold % len(folds)                                  # fold k es la prueba, k+1 la validación
+    te, va = folds[k], folds[(k + 1) % len(folds)]
+    tr = np.concatenate([f for j, f in enumerate(folds) if j not in (k, (k + 1) % len(folds))])
     for nombre, ix in (("train", tr), ("val", va), ("test", te)):
         if len(np.unique(labels[ix])) < 2:
             raise SystemExit(f"Con --por_grupo el conjunto {nombre} quedó con una sola clase: hay muy pocos grupos. "
@@ -263,36 +315,54 @@ def main():
     ap.add_argument("--relleno", choices=["repetir", "mantener"], default="repetir",
                     help="repetir: recorta el relleno sin voz y repite el contenido (recomendado); "
                          "mantener: comportamiento anterior (relleno con el mínimo)")
+    ap.add_argument("--canal_prob", type=float, default=0.8,
+                    help="probabilidad de perturbar el canal (ruido de fondo, respuesta en frecuencia, ancho de banda) "
+                         "en cada muestra de entrenamiento. 0 = sin aumento (reproduce el comportamiento anterior)")
     ap.add_argument("--por_grupo", action="store_true",
                     help="separa el español por hablante/voz (ver grupos_es.py): evaluación más exigente")
-    ap.add_argument("--n_boot", type=int, default=1000, help="remuestreos bootstrap para los IC 95 % (0 = sin IC)")
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--n_boot", type=int, default=1000, help="remuestreos bootstrap para los IC 95 %% (0 = sin IC)")
+    ap.add_argument("--seed", type=int, default=42, help="semilla de inicialización y de aumentos")
+    ap.add_argument("--split_seed", type=int, default=42,
+                    help="semilla de las particiones. Fija: así varias --seed comparten los mismos conjuntos de prueba")
+    ap.add_argument("--fold", type=int, default=None,
+                    help="validación cruzada por persona (7 folds): este fold es la prueba. Implica --por_grupo")
+    ap.add_argument("--pre_dir", default=None,
+                    help="reutiliza <modelo>_pre.pt de esta carpeta en vez de repetir la etapa 1 (ahorra horas en CV)")
+    ap.add_argument("--smooth", type=float, default=0.05, help="label smoothing en entrenamiento (0 = sin)")
+    ap.add_argument("--amp", action="store_true", help="precisión mixta en GPU (más rápido)")
     ap.add_argument("--workers", type=int, default=0,
                     help="procesos para leer datos. 0 = en el proceso principal (más estable en Windows)")
     a = ap.parse_args()
 
+    if a.fold is not None:
+        a.por_grupo = True
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out = Path(a.out); out.mkdir(exist_ok=True, parents=True)
 
     # --- splits (los mismos para CNN y LSTM) ---
     mp, my = list_files(a.multi_dir)
-    mtr_p, mva_p, mtr_y, mva_y = train_test_split(mp, my, test_size=0.15, stratify=my, random_state=a.seed)
+    mtr_p, mva_p, mtr_y, mva_y = train_test_split(mp, my, test_size=0.15, stratify=my, random_state=a.split_seed)
     ep_, ey = list_files(a.es_dir)
-    i_tr, i_va, i_te = partir_espanol(ep_, ey, a.por_grupo, a.seed)
+    i_tr, i_va, i_te = partir_espanol(ep_, ey, a.por_grupo, a.split_seed, a.fold or 0)
     etr_p, etr_y, eva_p, eva_y, ete_p, ete_y = ep_[i_tr], ey[i_tr], ep_[i_va], ey[i_va], ep_[i_te], ey[i_te]
+    np.save(out / "es_test_idx.npy", i_te)               # posición de cada audio de prueba en la lista completa
     json.dump({"multi_train": mtr_p.tolist(), "multi_val": mva_p.tolist(), "es_train": etr_p.tolist(),
                "es_val": eva_p.tolist(), "es_test": ete_p.tolist()}, open(out / "splits.json", "w"), indent=1)
     n_mels = np.load(mp[0]).shape[0]
     print(f"multi: train={len(mtr_p)} val={len(mva_p)} | español: train={len(etr_p)} val={len(eva_p)} test={len(ete_p)}"
           f" | n_mels={n_mels} frames={a.n_frames} | {device}")
 
-    mk = lambda p, l, tr: DataLoader(SpecDataset(p, l, a.n_frames, tr, a.relleno), batch_size=a.batch, shuffle=tr,
+    mk = lambda p, l, tr, x=False: DataLoader(SpecDataset(p, l, a.n_frames, tr, a.relleno, a.canal_prob if tr else 0.0, x),
+                                              batch_size=a.batch, shuffle=tr,
                                      num_workers=a.workers, persistent_workers=a.workers > 0,
                                      pin_memory=(device == "cuda"))
     L_mtr, L_mva = mk(mtr_p, mtr_y, True), mk(mva_p, mva_y, False)
     L_etr, L_eva, L_ete = mk(etr_p, etr_y, True), mk(eva_p, eva_y, False), mk(ete_p, ete_y, False)
     L_eall = mk(ep_, ey, False)     # todo el español, para la condición A (no entrena con él)
+    L_ete_x, L_eall_x = mk(ete_p, ete_y, False, True), mk(ep_, ey, False, True)   # pruebas de robustez al canal
+    L_eva_x = mk(eva_p, eva_y, False, True)             # validación con otro canal: para calibrar sin exceso de confianza
+    temps = {}
 
     results, preds, history, rows = {}, {}, {}, []
     for name in ["cnn", "lstm"]:
@@ -301,13 +371,23 @@ def main():
         # ---------- ETAPA 1: preentrenamiento multilingüe ----------
         print(f"\n=== {name.upper()} · ETAPA 1: preentrenamiento multilingüe ===")
         model = build(name, n_mels).to(device)
-        history[name]["pre"] = fit(model, L_mtr, L_mva, mtr_y, device, a.epochs_pre, a.lr_pre, a.patience,
-                                   out / f"{name}_pre.pt", f"{name} pre", a.lr_patience)
+        pre_f = Path(a.pre_dir, f"{name}_pre.pt") if a.pre_dir else None
+        # el .done se escribe SOLO cuando el preentrenamiento terminó: un .pt a medias de una corrida interrumpida no cuenta
+        if pre_f is not None and pre_f.exists() and pre_f.with_suffix(".done").exists():
+            print(f"(reutilizo {pre_f})")
+            model.load_state_dict(torch.load(pre_f, map_location=device)); history[name]["pre"] = []
+            if pre_f.resolve() != (out / f"{name}_pre.pt").resolve():
+                shutil.copy(pre_f, out / f"{name}_pre.pt")
+        else:
+            history[name]["pre"] = fit(model, L_mtr, L_mva, mtr_y, device, a.epochs_pre, a.lr_pre, a.patience,
+                                       out / f"{name}_pre.pt", f"{name} pre", a.lr_patience, a.smooth, a.amp)
+            (out / f"{name}_pre.done").touch()
         yv, pv, _ = predict(model, L_mva, device)
         results[name]["0_multilingue_val"] = {"auc": roc_auc_score(yv, pv),
                                               "accuracy": accuracy_score(yv, pv >= .5)}
-        results[name]["A_preentrenado_sin_ver_es"], preds[name]["A"] = evaluate(model, L_eva, L_ete, device, a.n_boot)
-        results[name]["A_todo_espanol"], preds[name]["A_todo"] = evaluate_todo(model, L_eall, device, a.n_boot)
+        results[name]["A_preentrenado_sin_ver_es"], preds[name]["A"] = evaluate(model, L_eva, L_ete, device, a.n_boot, L_ete_x)
+        results[name]["A_todo_espanol"], preds[name]["A_todo"] = evaluate_todo(model, L_eall, device, a.n_boot, L_eall_x)
+        temps[(name, "A")] = ajustar_temperatura(*logits_de(model, L_eva_x, device)[:1], eva_y)
         rows += registro(model, ete_p, ete_y, a.n_frames, device, name, "A_preentrenado", a.relleno)
 
         # ---------- ETAPA 2: quitar última capa + afinar con español ----------
@@ -315,19 +395,22 @@ def main():
         replace_last_layer(model); model.to(device)
         set_backbone_trainable(model, False)                      # 2a: solo aprende la capa nueva
         fit(model, L_etr, L_eva, etr_y, device, a.epochs_head, a.lr_head, a.patience,
-            out / f"{name}_head.pt", f"{name} capa", a.lr_patience)
+            out / f"{name}_head.pt", f"{name} capa", a.lr_patience, a.smooth, a.amp)
         set_backbone_trainable(model, True)                       # 2b: se afina toda la red con lr bajo
         history[name]["ft"] = fit(model, L_etr, L_eva, etr_y, device, a.epochs_ft, a.lr_ft, a.patience,
-                                  out / f"{name}.pt", f"{name} afinado", a.lr_patience)
-        results[name]["B_preentrenado_y_afinado_es"], preds[name]["B"] = evaluate(model, L_eva, L_ete, device, a.n_boot)
+                                  out / f"{name}.pt", f"{name} afinado", a.lr_patience, a.smooth, a.amp)
+        results[name]["B_preentrenado_y_afinado_es"], preds[name]["B"] = evaluate(model, L_eva, L_ete, device, a.n_boot, L_ete_x)
+        temps[(name, "B")] = ajustar_temperatura(*logits_de(model, L_eva_x, device)[:1], eva_y)
         rows += registro(model, ete_p, ete_y, a.n_frames, device, name, "B_afinado_es", a.relleno)
 
         # ---------- Línea base: solo español, sin preentrenar ----------
         print(f"\n=== {name.upper()} · LÍNEA BASE: solo español ===")
         base = build(name, n_mels).to(device)
         fit(base, L_etr, L_eva, etr_y, device, a.epochs_pre, a.lr_pre, a.patience, out / f"{name}_solo_es.pt",
-            f"{name} solo-es", a.lr_patience)
-        results[name]["C_solo_espanol"], preds[name]["C"] = evaluate(base, L_eva, L_ete, device, a.n_boot)
+            f"{name} solo-es", a.lr_patience, a.smooth, a.amp)
+        results[name]["C_solo_espanol"], preds[name]["C"] = evaluate(base, L_eva, L_ete, device, a.n_boot, L_ete_x)
+        temps[(name, "C")] = ajustar_temperatura(*logits_de(base, L_eva_x, device)[:1], eva_y)
+        results[name]["temperaturas"] = {k: temps[(name, k)] for k in "ABC"}
         rows += registro(base, ete_p, ete_y, a.n_frames, device, name, "C_solo_es", a.relleno)
         results[name]["params"] = sum(p.numel() for p in model.parameters())
 
@@ -384,7 +467,9 @@ def main():
             m = results[name][k][sub]
             ic = (m.get("ic95") or {}).get("auc")
             ic = f" [{ic[0]:.3f}, {ic[1]:.3f}]" if ic else ""
-            print(f"{name.upper():5s} {k:28s} acc={m['accuracy']:.3f} f1={m['f1']:.3f} auc={m['auc']:.3f}{ic}")
+            ex = results[name][k].get("test_estres")
+            ex = f"  | con otro canal: acc={ex['accuracy']:.3f} auc={ex['auc']:.3f}" if ex else ""
+            print(f"{name.upper():5s} {k:28s} acc={m['accuracy']:.3f} f1={m['f1']:.3f} auc={m['auc']:.3f}{ic}{ex}")
     for k, d in comparacion.items():
         veredicto = "no hay diferencia clara" if d["ic95"][0] <= 0 <= d["ic95"][1] else \
             ("CNN mejor" if d["delta_auc"] > 0 else "LSTM mejor")
@@ -394,3 +479,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # salida inmediata: en Windows, el cierre normal de CUDA/DataLoader a veces falla DESPUÉS de guardar todo
+    # y devuelve un código de error aunque el entrenamiento terminó bien
+    import os, sys
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(0)
