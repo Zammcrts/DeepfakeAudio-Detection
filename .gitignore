@@ -15,3 +15,4 @@ prueba_cpu/
 *.npy
 *.log
 resultados_cv/
+resultados_v3/

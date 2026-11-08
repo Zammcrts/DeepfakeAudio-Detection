@@ -31,15 +31,23 @@ N_MELS = 128
 FMIN = 20
 FMAX = SR // 2
 N_FRAMES = 1 + int(SR * DURACION) // HOP          # 431 con los valores anteriores
+BANDA = 16000    # frecuencia por la que pasa TODO audio nuevo (la interfaz y las pruebas): recorta lo que hay arriba de 8 kHz
 
 
 # ----------------------------------------------------------------------------- 1. audio -> espectrograma
-def audio_a_mel(origen):
+def audio_a_mel(origen, banda=BANDA):
     """Mel-espectrograma en dB absolutos, forma (n_mels, frames), de un archivo de audio COMPLETO.
     Igual que el script de generación, salvo que no recorta a 10 s (preparar() toma ventanas) y que un audio
-    más corto de 10 s se rellena con ceros para dar el mismo espectrograma que un .npy de entrenamiento."""
+    más corto de 10 s se rellena con ceros para dar el mismo espectrograma que un .npy de entrenamiento.
+
+    banda=16000 (por defecto): el audio pasa primero por 16 kHz y se vuelve a subir a 22,050 Hz, así que se pierde todo
+    lo que está arriba de 8 kHz. Por qué: la mayoría de los datos de entrenamiento (HISPASpoof, CIEMPIESS, conferencias y
+    notas de voz) tienen ese ancho de banda, y probar las mismas notas de voz de WhatsApp sin este paso (mp3 a 44 kHz)
+    daba un 8-23 % de reales aceptados contra 42-88 % con él. banda=0 lee el audio a 22,050 Hz sin recortar."""
     import librosa
-    y, _ = librosa.load(str(origen), sr=SR, mono=True)
+    y, _ = librosa.load(str(origen), sr=banda or SR, mono=True)
+    if banda and banda != SR:
+        y = librosa.resample(y, orig_sr=banda, target_sr=SR)
     largo = int(SR * DURACION)
     if len(y) < largo:
         y = np.pad(y, (0, largo - len(y)))
@@ -102,7 +110,7 @@ def preparar(s, n_frames=N_FRAMES, modo="repetir", max_ventanas=8):
 
 
 # ----------------------------------------------------------------------------- aumento "de canal" (solo entrenamiento)
-def perturbar_canal(s, rng=None, p=0.8):
+def perturbar_canal(s, rng=None, p=0.8, fuerte=False):
     """Simula otra grabación del MISMO audio: otro ruido de fondo, otra respuesta en frecuencia y, a veces,
     otro ancho de banda. Se aplica sobre el espectrograma en dB, antes de normalizar.
 
@@ -111,6 +119,10 @@ def perturbar_canal(s, rng=None, p=0.8):
     y saca ~100 % en el dataset, pero falla con grabaciones nuevas. Al variar esas propiedades al azar, la red
     ya no puede apoyarse en ellas y tiene que usar lo que sí cambia entre voz real y sintética (textura fina,
     armónicos, transiciones). Los artefactos de la síntesis no viven en el suelo de ruido ni en la inclinación.
+
+    fuerte=True: variación más amplia (inclinación global de hasta ±15 dB, respuesta en frecuencia de ±8 dB, paso bajo
+    en el 60 % de las muestras y con cortes más bajos). Simula micrófonos de celular y códecs que recortan agudos. Solo se
+    usa al entrenar con --canal_fuerte; la prueba de estrés y la interfaz no lo usan.
     """
     rng = rng or np.random.default_rng()
     if rng.random() > p:
@@ -121,15 +133,17 @@ def perturbar_canal(s, rng=None, p=0.8):
     rango = max(float(hi - lo), 1.0)
     # 1) ruido de fondo de nivel y color aleatorios, sumado en potencia
     nivel = rng.uniform(lo - 5.0, lo + 0.4 * rango)
-    color = np.interp(np.arange(n_mels), np.linspace(0, n_mels - 1, 4), rng.normal(0, 5.0, 4))
+    color = np.interp(np.arange(n_mels), np.linspace(0, n_mels - 1, 4), rng.normal(0, 8.0 if fuerte else 5.0, 4))
     ruido = (nivel + color[:, None]).astype(np.float32) + rng.standard_normal((n_mels, T), dtype=np.float32)
     k = np.float32(np.log(10) / 10)
     s = np.logaddexp(s * k, ruido * k) / k
     # 2) respuesta en frecuencia suave (micrófono / canal)
-    s = s + np.interp(np.arange(n_mels), np.linspace(0, n_mels - 1, 6), rng.normal(0, 4.0, 6))[:, None]
+    s = s + np.interp(np.arange(n_mels), np.linspace(0, n_mels - 1, 6), rng.normal(0, 8.0 if fuerte else 4.0, 6))[:, None]
+    if fuerte:   # inclinación global: más graves/menos agudos o al revés
+        s = s + np.linspace(rng.uniform(-15, 15), 0.0, n_mels).astype(np.float32)[:, None]
     # 3) a veces, ancho de banda limitado (paso bajo con caída progresiva)
-    if rng.random() < 0.3:
-        corte = int(rng.uniform(0.5, 0.95) * n_mels)
-        caida = np.zeros(n_mels); caida[corte:] = np.linspace(0, rng.uniform(10, 30), n_mels - corte)
+    if rng.random() < (0.6 if fuerte else 0.3):
+        corte = int(rng.uniform(0.35 if fuerte else 0.5, 0.95) * n_mels)
+        caida = np.zeros(n_mels); caida[corte:] = np.linspace(0, rng.uniform(10, 40 if fuerte else 30), n_mels - corte)
         s = s - caida[:, None]
     return s.astype(np.float32)

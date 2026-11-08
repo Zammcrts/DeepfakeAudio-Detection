@@ -18,6 +18,14 @@ from pathlib import Path
 
 
 def grupo(nombre):
+    # Audios de HISPASpoof (hs_<generador>_speaker_<n>_sentence_<m>): el grupo es el hablante, y el real y
+    # todos sus falsos quedan juntos.
+    h = re.match(r"^hs_.+?_speaker_(\d+)_sentence_\d+$", Path(nombre).stem)
+    if h:
+        return f"hs{h.group(1)}"
+    e = re.match(r"^ext_([a-z0-9]+)_([A-Za-z0-9]+)_\d+$", Path(nombre).stem)
+    if e:                              # audios reales de otras fuentes (audios_a_npy.py): una persona/charla = un grupo
+        return f"ext{e.group(1)}{e.group(2).lower()}"
     n = re.sub(r"_\d+$", "", Path(nombre).stem)
     if "-" in n:
         n = n.split("-")[-1]

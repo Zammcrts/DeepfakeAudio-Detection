@@ -1,432 +1,301 @@
-# Entrenamiento de los modelos CNN y LSTM para detección de audio deepfake
+# Entrenamiento y evaluación de los modelos CNN y LSTM
 
-Este documento explica, paso a paso y con lenguaje técnico, **cómo se entrenan y evalúan** los dos modelos del proyecto. Está escrito para que alguien que no conoce el proyecto pueda entender qué se hace, en qué orden y por qué. Corresponde al código de `models.py`, `preprocesamiento.py`, `train.py` y `entrenar_cv.py`. Los resultados obtenidos están en la sección 14 y, con más detalle, en `RESULTADOS.md`.
+En este documento se describe el procedimiento mediante el cual se entrenan y evalúan los dos modelos del proyecto, de manera que pueda reproducirse y auditarse. Corresponde al código de `models.py`, `preprocesamiento.py`, `train.py` y `entrenar_cv.py`. Los resultados se resumen en la sección 11 y se analizan en [`RESULTADOS.md`](RESULTADOS.md).
+
+## Contenido
+
+1. [Visión general](#1-visión-general)
+2. [Datos y particiones](#2-datos-y-particiones)
+3. [Preprocesamiento](#3-preprocesamiento)
+4. [Arquitecturas](#4-arquitecturas)
+5. [Optimización y control del entrenamiento](#5-optimización-y-control-del-entrenamiento)
+6. [Entrenamiento en dos etapas](#6-entrenamiento-en-dos-etapas)
+7. [Condiciones experimentales y métricas](#7-condiciones-experimentales-y-métricas)
+8. [Correcciones metodológicas](#8-correcciones-metodológicas)
+9. [Orquestación y archivos generados](#9-orquestación-y-archivos-generados)
+10. [Ejecución](#10-ejecución)
+11. [Resumen de resultados](#11-resumen-de-resultados)
+12. [Limitaciones](#12-limitaciones)
 
 ---
 
 ## 1. Visión general
 
-**Problema.** Clasificación binaria supervisada: dado un audio, decidir si es **real** (voz humana) o **fake** (voz sintetizada o manipulada con IA).
+**Tarea.** Clasificación binaria supervisada: dado un audio, determinar si corresponde a voz humana (**real**, clase 0) o a voz sintetizada o manipulada con inteligencia artificial (**fake**, clase 1). Por convención, *fake* es la clase positiva en el cálculo de las métricas.
 
-**Entrada.** No se usa el audio crudo, sino su **espectrograma** (una matriz `n_mels × frames`, guardada como archivo `.npy`).
+**Entrada.** El modelo no recibe la señal temporal sino su **mel-espectrograma**, una matriz de energía por banda de frecuencia e instante que hace visibles los artefactos característicos de los sintetizadores.
 
-**Modelos.** Dos redes neuronales con enfoques distintos, que se comparan entre sí:
+**Modelos comparados.** Una red convolucional (**CNN**), que interpreta el espectrograma como una imagen, y una red recurrente (**LSTM**), que lo interpreta como una secuencia de instantes. Ambos reciben los mismos datos, las mismas particiones y el mismo procedimiento, de modo que una diferencia de desempeño se atribuye a la arquitectura y no a otra variable.
 
-- **CNN** (red convolucional): analiza el espectrograma como una imagen.
-- **LSTM** (red recurrente): analiza el espectrograma como una secuencia de instantes.
-
-**Estrategia de entrenamiento.** Transferencia de aprendizaje (*transfer learning*) en dos etapas:
+**Estrategia.** Transferencia de aprendizaje en dos etapas, seguida de una evaluación agrupada por hablante:
 
 ```
-ETAPA 1  Preentrenamiento
-         ~16.5k audios multilingües (9,569 reales / 6,977 fake)
-         La red aprende, desde cero, qué distingue lo real de lo fake.
-                         │
-                         ▼
-ETAPA 2  Adaptación al español (fine-tuning)
-         Se quita la última capa, se pone una nueva y se reajusta
-         con los audios en español (502 reales / 461 fake).
-                         │
-                         ▼
-EVALUACIÓN  Validación cruzada por persona (7 folds): cada audio en español
-            se predice con modelos que no vieron a su hablante.
+ETAPA 1  Preentrenamiento multilingüe (≈ 16.5 mil audios)
+         La red aprende, desde pesos aleatorios, rasgos generales que distinguen real de fake.
+                          │
+                          ▼
+ETAPA 2  Adaptación al español (ajuste fino)
+         Se reemplaza la capa final y se reajusta con el conjunto ampliado en español.
+                          │
+                          ▼
+EVALUACIÓN  Validación cruzada de 7 particiones agrupada por hablante: cada audio se
+            clasifica con modelos que no vieron a su hablante.
 ```
 
-Los dos modelos reciben **exactamente los mismos datos, las mismas particiones y el mismo procedimiento**. Así, si su desempeño difiere, la diferencia se debe a la arquitectura y no a otra variable.
-
 ---
 
----
+## 2. Datos y particiones
 
-## 2. Los datos de entrada
+### 2.1 Conjuntos de datos
 
-### 2.1 Qué es un archivo `.npy`
+El diseño distingue dos grupos de datos con funciones diferentes. El **conjunto multilingüe** (9,569 audios reales y 6,977 sintéticos) se emplea únicamente en el preentrenamiento y permite estudiar si lo aprendido en otros idiomas se transfiere al español. El **conjunto en español ampliado** (`espanol_v3`) se emplea en el ajuste, en la línea base y en toda la evaluación. Integra cuatro orígenes:
 
-Es una matriz de NumPy con el **mel-espectrograma en decibeles** del audio:
+- el conjunto original, de 963 audios y 21 hablantes, cada uno con su clon sintético;
+- una muestra balanceada de **HISPASpoof** con voces naturales y sintéticas generadas con ElevenLabs, F5-TTS, XTTS v2 y YourTTS (archivos `hs_<herramienta>_speaker_<n>_sentence_<m>`);
+- voces reales de **CIEMPIESS**;
+- voces reales de **conferencias** (13 fuentes) y de **otras personas** (14), segmentadas en fragmentos de 10 s.
 
-- Eje vertical (`n_mels` = 128): bandas de frecuencia en escala Mel, que imita cómo percibimos el sonido.
-- Eje horizontal (`frames` = 431): instantes de tiempo (≈ 10 s).
-- Valor de cada celda: energía de esa banda en ese instante, en dB **absolutos**.
+La ampliación obedece a un hallazgo del diagnóstico: con el conjunto original, ambos modelos alcanzaban un desempeño cercano al 100 % que no se mantenía con audios de otras fuentes, lo que indicaba el aprendizaje de rasgos de la grabación y no de la voz sintética. Los conjuntos nuevos se incorporaron mediante copias, sin modificar el original.
 
-Los parámetros con los que se generaron (script de conversión del equipo): `sr = 22050`, `n_fft = 2048`, `hop_length = 512`, `n_mels = 128`, `fmin = 20`, `fmax = 11025`, potencia 2, `power_to_db(ref = 1.0, top_db = None)`, y cada audio se **recorta o rellena con ceros a 10 s antes** de calcular el espectrograma. Esos ceros aparecen en el espectrograma como frames "planos" (todas las bandas en −100 dB).
+### 2.2 Verificación y depuración
 
-Las voces sintéticas suelen dejar rastros en esta representación (texturas demasiado uniformes, artefactos en frecuencias altas, transiciones poco naturales). Las redes aprenden a detectarlos a partir de ejemplos etiquetados.
+Antes de entrenar se verificó la integridad de los datos con `verificar_datos.py` (huella MD5) y se depuraron con `deduplicar_datos.py`. Todos los espectrogramas tienen forma 128 × 431. Se apartaron, sin eliminarlos, los duplicados exactos: 246 en el conjunto multilingüe (40 reales y 206 sintéticos) y 40 sintéticos en español. No existen archivos compartidos entre ambos conjuntos ni idénticos en clases distintas. La verificación solo detecta copias exactas, no un mismo audio exportado de otra forma; por ello la partición se realiza además por hablante.
 
-### 2.2 Preparación de cada muestra (`SpecDataset` + `preprocesamiento.py`)
+### 2.3 Particiones
 
-Todo el preprocesamiento vive en `preprocesamiento.py`, y **el mismo código lo usan el entrenamiento y la interfaz**. Cada espectrograma pasa por estos pasos:
+Las particiones emplean semilla fija (`--split_seed 42`) y los índices de prueba de cada fold se conservan en `es_test_idx.npy`.
 
-1. **Acondicionamiento a `n_frames` frames** (`acondicionar`; `--relleno repetir`, por defecto).
-   - Se **recortan los frames planos** de los extremos (el relleno de ceros, que no tiene voz).
-   - Si lo que queda es más corto que `n_frames`, el contenido con voz se **repite** hasta llenar la ventana. Si es más largo, se toma una ventana (en entrenamiento, en posición aleatoria; en validación y prueba, desde el inicio, para resultados deterministas).
-   - *Por qué:* el diagnóstico mostró que, en el conjunto multilingüe, entre 53 % y 63 % de cada clip es relleno de ceros, mientras que en español casi no hay. Con el recorte aleatorio, muchas ventanas caían en puro relleno, y la duración del clip se volvía una pista ajena a la voz. Con este paso toda muestra tiene voz de principio a fin. `--relleno mantener` reproduce el comportamiento anterior.
-2. **Aumento de canal** (solo en entrenamiento, `--canal_prob`, 0.8 por defecto; `perturbar_canal`). Simula otra grabación del mismo audio: suma un ruido de fondo de nivel y color aleatorios, aplica una respuesta en frecuencia suave aleatoria y, en 30 % de los casos, limita el ancho de banda.
-   - *Por qué:* el diagnóstico mostró que real y fake en español se distinguían por el suelo de ruido, el rango dinámico y la forma espectral (condiciones de grabación). Una red pequeña aprende ese atajo y sacaría ~100 % sin saber detectar voz sintética. Variar esas propiedades al azar le quita ese apoyo. Los artefactos de síntesis no viven en el suelo de ruido ni en la inclinación del espectro.
-3. **Normalización por muestra (z-score):** `s = (s − media) / (desviación + 1e-8)`. Elimina diferencias de volumen o ganancia entre grabaciones, de modo que el modelo se fije en la *forma* del espectro. **La interfaz aplica exactamente la misma normalización.**
-4. **SpecAugment (solo en entrenamiento):** se enmascaran con cero una franja aleatoria de frecuencias (hasta 11 bandas) y una franja de tiempo (hasta 19 frames). Tras la normalización, cero equivale a la media. Obliga a la red a no depender de una región específica.
+- **Conjunto multilingüe.** División estratificada: 85 % para entrenamiento (≈ 14,064 audios) y 15 % para validación (≈ 2,482). El preentrenamiento no depende del español y se reutiliza (`*_pre.pt`, `*_pre.done`) en todos los folds.
+- **Conjunto en español.** Validación cruzada de 7 particiones agrupada por hablante (`StratifiedGroupKFold`). El módulo `grupos_es.py` asigna el grupo de cada audio: la persona real y su clon comparten grupo; en HISPASpoof el grupo es el hablante (`hs<n>`); en las fuentes externas, la fuente y la persona (`ext<fuente><persona>`).
 
-En la interfaz, un audio se convierte con `audio_a_mel` (mismos parámetros y relleno de ceros a 10 s) y `preparar` toma ventanas de 431 frames con solape de 50 % (hasta 8); se promedian las probabilidades de las ventanas.
+En cada fold, los conjuntos cumplen funciones independientes:
 
-### 2.3 Etiquetas
-
-Se toman del nombre de la carpeta: `real` → clase **0**, `fake` → clase **1**. Por convención, **fake es la clase positiva** al calcular métricas.
-
----
-
-## 3. Particiones de los datos
-
-Las particiones usan semilla fija (`--split_seed 42`) para que sean reproducibles. Los índices del conjunto de prueba de cada fold quedan en `es_test_idx.npy`.
-
-**Multilingüe** (estratificado): 85 % entrenamiento (≈ 14,064) y 15 % validación (≈ 2,482). Solo se usa en la etapa 1.
-
-**Español: validación cruzada por persona (7 folds).** Los 963 audios en español pertenecen a **21 personas**, y cada persona tiene un **clon de IA** (por ejemplo `karina` y `karinaia`). Se agrupa por persona (`grupos_es.py`, que une a la persona real con su clon) y se forman 7 grupos de 3 personas. En cada fold:
-
-| Conjunto | Contenido | Uso |
+| Conjunto | Contenido | Función |
 |---|---|---|
-| **Prueba** | 1 grupo (3 a 4 personas, real y clon) | Solo evaluación final |
-| **Validación** | el grupo siguiente | Early stopping, selección de modelo, umbral y calibración |
-| **Entrenamiento** | los 5 grupos restantes (≈ 690 a 710 audios) | Etapa 2 y línea base |
+| Entrenamiento | cinco grupos de hablantes | Ajuste de los pesos (etapa 2 y línea base) |
+| Validación | un grupo adicional | Decidir cuándo detener el entrenamiento, qué versión conservar, qué umbral usar y cómo calibrar |
+| Prueba | un grupo adicional | Evaluación final; no interviene en ninguna decisión |
 
-Al terminar los 7 folds, cada audio fue probado exactamente una vez, siempre por modelos que **no vieron a esa persona ni a su clon** (*out-of-fold*). Así las métricas miden generalización a voces nuevas y no reconocimiento de personas.
-
-**Para qué sirve cada conjunto:**
-
-- **Entrenamiento:** los datos con los que la red ajusta sus pesos.
-- **Validación:** datos que la red no usa para ajustar pesos, pero que sirven para decidir *cuándo parar*, *qué versión conservar*, *qué umbral usar* y *cómo calibrar*.
-- **Prueba:** datos que **nunca** influyen en ninguna decisión.
-
-### 3.1 Verificación y limpieza de los datos
-
-Antes de entrenar se revisaron los datos con `training/verificar_datos.py`, que compara el contenido de cada archivo (huella MD5), y se limpiaron con `training/deduplicar_datos.py`:
-
-- Todos los espectrogramas tienen 128 bandas Mel × 431 frames.
-- Se encontraron y apartaron **duplicados exactos**: 246 en el conjunto multilingüe (40 reales y 206 fake) y 40 fake en español. Se movieron a carpetas `*_duplicados`, sin borrarlos.
-- No hay archivos compartidos entre el conjunto multilingüe y el de español, ni archivos con la misma huella en clases distintas.
-- Conteos finales: multilingüe **9,569 reales y 6,977 fake** (16,546); español **502 reales y 461 fake** (963).
-
-La verificación solo detecta copias exactas, no un mismo audio exportado de otra forma. Por eso el español se separa también por persona.
+Al concluir los siete folds, cada audio fue evaluado una única vez por modelos que no conocieron a su hablante (*out-of-fold*). Esta propiedad hace que las métricas midan generalización a voces nuevas y no reconocimiento de personas.
 
 ---
-## 4. Arquitecturas (`models.py`)
 
-Ambos modelos terminan en **2 salidas** (logits): índice 0 = real, índice 1 = fake. Aplicar *softmax* a esas salidas produce probabilidades que suman 1, que son los porcentajes que se muestran en la interfaz (p. ej. "78 % fake / 22 % real").
+## 3. Preprocesamiento
+
+El módulo `preprocesamiento.py` concentra todas las transformaciones y es el mismo para el entrenamiento y para la interfaz de prueba. Esta unicidad garantiza que el audio que clasifica la interfaz reciba el mismo tratamiento que el evaluado.
+
+### 3.1 Representación
+
+Cada audio se convierte en un mel-espectrograma en decibeles absolutos con los parámetros `sr = 22,050 Hz`, `n_fft = 2048`, `hop = 512`, `n_mels = 128`, `fmin = 20 Hz` y potencia 2, para una ventana fija de 10 s (431 frames). Los segmentos más cortos se completan con ceros, que aparecen como frames planos.
+
+### 3.2 Pasos aplicados a cada muestra
+
+1. **Limitación de banda (`BANDA = 16000`).** El audio se carga a 16 kHz y se remuestrea a 22,050 Hz, lo que descarta el contenido por encima de 8 kHz. Los datos de entrenamiento poseen aproximadamente ese ancho de banda; los audios con frecuencia de muestreo superior (p. ej., mp3 a 44.1 o 48 kHz) incorporan energía adicional que el modelo interpretaba como indicio de audio no real, lo que producía falsos positivos sobre voces reales de teléfono. Los conjuntos incorporados posteriormente se convirtieron con la misma banda (`--sr_banda 16000`). Con `banda = 0` se reproduce el comportamiento anterior.
+2. **Acondicionamiento a `n_frames` (`--relleno repetir`).** Se recortan los frames planos de los extremos y el contenido con voz se repite hasta completar la ventana; si es más largo, se toma una ventana (aleatoria en entrenamiento, desde el inicio en validación y prueba). Con ello se evita que la duración del clip actúe como indicio, ya que entre 53 % y 63 % de cada clip multilingüe es relleno.
+3. **Aumento de canal** (solo en entrenamiento, `--canal_prob 0.8`). Simula otra grabación del mismo audio mediante ruido de fondo de nivel y color aleatorios, una respuesta en frecuencia suave aleatoria y, con probabilidad 0.3, limitación del ancho de banda. La opción `--canal_fuerte`, empleada en el entrenamiento final, amplía los rangos: ruido de color de desviación 8 dB, respuesta en frecuencia de desviación 8 dB, inclinación global de ±15 dB, filtro pasa-bajos con probabilidad 0.6 y corte entre 0.35 y 0.95 de la banda, y caída de hasta 40 dB. Su finalidad es impedir que el modelo se apoye en las condiciones de grabación, pues los artefactos de síntesis no residen en el suelo de ruido ni en la inclinación del espectro.
+4. **Normalización por muestra (z-score).** Elimina diferencias de ganancia entre grabaciones para que el modelo atienda a la forma del espectro.
+5. **SpecAugment** (solo en entrenamiento). Enmascara una franja de frecuencias (hasta 11 bandas) y una de tiempo (hasta 19 frames), de modo que la red no dependa de una región específica.
+
+En inferencia, `audio_a_mel` aplica la limitación de banda y `preparar` toma ventanas de 431 frames con solape del 50 % (hasta 8); las probabilidades de las ventanas se promedian.
+
+### 3.3 Formato de almacenamiento: `.npy` en lugar de imágenes
+
+Los espectrogramas se almacenan como matrices numéricas de NumPy (`.npy`, `float32`) y no como imágenes (PNG o JPG). La decisión se fundamenta en que el espectrograma, aunque se represente visualmente como una imagen, es en esencia una medición física: cada celda contiene la energía, en decibeles, de una banda de frecuencia en un instante. Para un clasificador, la información relevante es ese valor numérico, y cualquier formato de imagen introduce transformaciones que lo alteran.
+
+- **Conservación de la precisión.** Un `.npy` guarda el valor exacto en punto flotante. Una imagen estándar emplea 8 bits por canal, es decir, 256 niveles posibles; representar un intervalo dinámico de más de 100 dB en ese número de niveles obliga a cuantizar, con la consecuente pérdida de detalle en las diferencias de energía finas, que son precisamente las que pueden delatar una síntesis.
+- **Ausencia de mapas de color.** Para generar una imagen es necesario asignar cada valor a un color (por ejemplo, *viridis*). Esa asignación es arbitraria, expande la información de un canal a tres y obliga a la red a recuperar una magnitud que ya se conocía. El `.npy` se entrega a las redes como una matriz de un solo canal, sin intermediarios.
+- **Compresión sin pérdidas de información útil.** El formato JPG comprime con pérdidas y puede suavizar o crear artefactos en las zonas de alta frecuencia y en los bordes, que coinciden con las huellas que buscan los modelos; el resultado podría enmascarar rasgos de la síntesis o introducir rasgos falsos que dependen del algoritmo de compresión y no del audio. El formato PNG evita esta pérdida, pero mantiene la cuantización a 8 bits.
+- **Escala absoluta.** El procesamiento emplea decibeles absolutos y normaliza después por muestra (z-score). Al guardar una imagen, lo habitual es reescalar cada una a su propio mínimo y máximo, lo que elimina el nivel absoluto y vuelve incomparables los espectrogramas entre sí.
+- **Resolución tiempo-frecuencia intacta.** Las imágenes suelen redimensionarse (por ejemplo, a 224 × 224) o incluir ejes y márgenes, lo que interpola o recorta la matriz. El `.npy` conserva exactamente 128 bandas × 431 frames, de modo que cada fila mantiene su significado en frecuencia y cada columna, su posición en el tiempo. Esto es indispensable en la LSTM, que lee el espectrograma como una secuencia de instantes.
+- **Coherencia entre entrenamiento e inferencia.** Con `.npy`, la interfaz genera la matriz con `audio_a_mel` y la entrega directamente al modelo, de la misma forma que se hizo en el entrenamiento. Con imágenes habría que reproducir en ambos extremos la misma cadena de renderizado, escalado y compresión, con el riesgo de que diverja.
+- **Eficiencia.** Un espectrograma de 128 × 431 ocupa aproximadamente 215 KB en `float32`, se lee directamente como arreglo y no requiere decodificar ni convertir, lo que acelera la carga de más de 17 mil muestras en cada época.
+
+Las imágenes se reservan para la **visualización** de los resultados (por ejemplo, las figuras de `metricas_v3/figuras/`), donde su función es la comunicación y no la entrada a los modelos. Las redes convolucionales no requieren una imagen en sentido estricto: operan sobre cualquier matriz bidimensional, por lo que interpretar el espectrograma como "imagen" es una analogía de procesamiento y no un requisito de formato.
+
+---
+
+## 4. Arquitecturas
+
+Ambos modelos terminan en dos salidas (*logits*), una por clase. La función *softmax* las convierte en las probabilidades que presenta la interfaz.
 
 ### 4.1 CNN (≈ 404,900 parámetros)
 
-La red trata el espectrograma como una imagen de **1 canal**: `(batch, 1, 128, 128)`.
-
-**Un bloque convolucional** se compone de:
-
-| Capa | Qué hace |
-|---|---|
-| `Conv2d` 3×3 | Desliza filtros de 3×3 sobre la imagen. Cada filtro aprende a detectar un patrón local (bordes, texturas, armónicos). `padding=1` conserva el tamaño y `bias=False` porque la capa siguiente ya incluye un desplazamiento. |
-| `BatchNorm2d` | Normaliza las activaciones de cada lote. Estabiliza y acelera el aprendizaje. |
-| `ReLU` | No linealidad: `max(0, x)`. Sin ella, apilar capas equivaldría a una sola operación lineal. |
-| `MaxPool2d(2)` | Reduce a la mitad alto y ancho, conservando el valor máximo de cada ventana de 2×2. Aporta cierta invarianza a pequeños desplazamientos. |
-
-**Arquitectura completa:**
-
-| Etapa | Forma de salida |
-|---|---|
-| Entrada | `(B, 1, 128, 128)` |
-| Bloque 1 (1 → 32 filtros) | `(B, 32, 64, 64)` |
-| Bloque 2 (32 → 64) | `(B, 64, 32, 32)` |
-| Bloque 3 (64 → 128) | `(B, 128, 16, 16)` |
-| Bloque 4 (128 → 256) | `(B, 256, 8, 8)` |
-| `AdaptiveAvgPool2d(1)` | `(B, 256)` |
-| Cabeza: `Dropout(0.4)` → `Linear(256→64)` → `ReLU` → `Dropout(0.4)` → `Linear(64→2)` | `(B, 2)` |
-
-Las primeras capas detectan patrones simples (líneas, bordes) y las profundas los combinan en patrones complejos. El **promedio global** resume cada mapa de características en un solo número, lo que además hace que la red funcione con cualquier duración de entrada. Las formas de la tabla corresponden a 128 frames; con 431 frames el último mapa de la CNN es `(B, 256, 8, 26)` y la secuencia de la LSTM pasa de 128 a 431 pasos.
+La CNN interpreta el espectrograma como una imagen de un canal. Cada bloque convolucional combina `Conv2d` 3×3 (detección de patrones locales), `BatchNorm2d` (estabilización del aprendizaje), `ReLU` (no linealidad) y `MaxPool2d` (reducción espacial con cierta invarianza a desplazamientos). Cuatro bloques con 32, 64, 128 y 256 filtros extraen rasgos de complejidad creciente; un promedio global los resume y una cabeza `Dropout → Linear(256→64) → ReLU → Dropout → Linear(64→2)` produce la decisión. El promedio global permite, además, procesar entradas de duración distinta.
 
 ### 4.2 LSTM (≈ 692,700 parámetros)
 
-La red trata el espectrograma como una **secuencia**: cada frame es un vector de 128 números (el espectro de ese instante). Se transpone a `(batch, frames, 128)`.
+La LSTM interpreta el espectrograma como una secuencia de 431 vectores de 128 valores. Tras una `LayerNorm`, una LSTM **bidireccional** de dos capas y 128 unidades ocultas recorre la secuencia en ambos sentidos, de modo que cada instante queda contextualizado por el pasado y el futuro; esto permite capturar dependencias a largo plazo como el ritmo y el enlace entre sonidos. Un *pooling* temporal concatena la media (comportamiento general) y el máximo (eventos más marcados), y una cabeza `Dropout → Linear(512→64) → ReLU → Dropout → Linear(64→2)` produce la decisión.
 
-**Cómo funciona una LSTM.** Lee la secuencia en orden y mantiene una **memoria** (estado de celda). En cada paso, tres compuertas aprendidas deciden qué información nueva guardar (*input gate*), qué olvidar (*forget gate*) y qué exponer como salida (*output gate*). Eso le permite capturar dependencias a largo plazo: ritmo, entonación y la forma en que se enlazan los sonidos, aspectos donde los sintetizadores suelen fallar.
+---
 
-**Arquitectura completa:**
+## 5. Optimización y control del entrenamiento
 
-| Etapa | Detalle | Forma de salida |
+El entrenamiento repite, sobre lotes de 32 espectrogramas, el ciclo de propagación hacia adelante, cálculo de la pérdida, retropropagación y actualización de pesos. Las métricas de evaluación no intervienen en este ciclo: la red optimiza únicamente la función de pérdida.
+
+**Función de pérdida.** Entropía cruzada ponderada por clase, con pesos inversamente proporcionales a la frecuencia (`peso_c = N / (2·N_c)`), de modo que el desbalance entre reales y sintéticos no favorezca a la clase mayoritaria. Los pesos se recalculan en cada etapa.
+
+**Hiperparámetros.**
+
+| Elemento | Valor | Función |
 |---|---|---|
-| Entrada | espectrograma transpuesto | `(B, 128, 128)` |
-| `LayerNorm(128)` | normaliza cada frame | `(B, 128, 128)` |
-| `LSTM` | 2 capas, 128 unidades ocultas, **bidireccional**, dropout 0.4 entre capas | `(B, 128, 256)` |
-| Pooling temporal | concatena la **media** y el **máximo** sobre el tiempo | `(B, 512)` |
-| Cabeza: `Dropout(0.4)` → `Linear(512→64)` → `ReLU` → `Dropout(0.4)` → `Linear(64→2)` | | `(B, 2)` |
+| Optimizador | AdamW | Tasa de aprendizaje adaptativa con regularización de pesos desacoplada |
+| *Weight decay* | 1×10⁻⁴ | Penaliza pesos grandes |
+| Tasa de aprendizaje | 1×10⁻³ (etapa 1 y cabeza); 1×10⁻⁴ (ajuste completo) | Magnitud de cada actualización |
+| *Dropout* | 0.4 | Reduce el sobreajuste |
+| Recorte de gradiente | norma máxima 5.0 | Evita actualizaciones explosivas, relevantes en redes recurrentes |
+| `ReduceLROnPlateau` | factor 0.5, paciencia 5 | Reduce la tasa si la validación no mejora; su paciencia es menor que la del *early stopping* |
+| *Early stopping* | paciencia 15 | Detiene el entrenamiento sin mejora sostenida |
+| Épocas máximas | 100 (etapa 1), 20 (cabeza), 100 (ajuste y línea base) | Tope de seguridad |
+| *Label smoothing* | 0.05 | Evita la sobreconfianza con pocos datos; solo en la pérdida de entrenamiento |
+| Precisión mixta | `--amp` | Menor tiempo de cómputo en GPU |
 
-- **Bidireccional:** una LSTM lee la secuencia hacia adelante y otra hacia atrás; sus salidas se concatenan (por eso 128 × 2 = 256). Cada instante queda contextualizado por el pasado y el futuro.
-- **Media + máximo:** la media resume el comportamiento general del audio y el máximo captura los eventos más marcados. La combinación es más robusta que usar solo el último estado.
-
----
-
-## 5. Cómo aprende una red (conceptos base)
-
-Un ciclo de entrenamiento repite estos pasos sobre lotes de 32 espectrogramas:
-
-1. **Propagación hacia adelante (*forward*):** la red produce 2 logits por muestra.
-2. **Pérdida (*loss*):** se mide qué tan equivocada está la predicción.
-3. **Retropropagación (*backpropagation*):** se calcula cuánto contribuyó cada peso al error (gradiente).
-4. **Actualización:** el optimizador modifica los pesos en la dirección que reduce el error.
-
-Una pasada completa por todos los datos de entrenamiento es una **época**. Se repite durante varias épocas.
-
-> Las **métricas** (exactitud, F1, AUC…) **no intervienen en el entrenamiento**. La red solo optimiza la función de pérdida. Las métricas se calculan al final, con datos que la red no vio, para evaluarla.
-
-### 5.1 Función de pérdida: entropía cruzada ponderada
-
-`CrossEntropyLoss` mide la distancia entre las probabilidades predichas y la etiqueta verdadera: penaliza fuertemente cuando el modelo está muy seguro y se equivoca.
-
-**Pesos por clase.** Hay más audios reales que fake (9,569 vs 6,977). Sin corrección, la red tendería a favorecer la clase mayoritaria. Se pondera cada clase de forma inversamente proporcional a su frecuencia:
-
-```
-peso_c = N / (2 · N_c)      →   real ≈ 0.86,   fake ≈ 1.19   (etapa 1)
-```
-
-Así, equivocarse con un audio fake cuesta algo más que equivocarse con uno real. Los pesos se recalculan con las etiquetas de cada etapa.
+**Selección del modelo.** Tras cada época se mide la pérdida de validación y se guarda el modelo solo si mejora; al finalizar se recarga el mejor y no el último. Esta práctica protege contra el sobreajuste, que se manifiesta como una pérdida de entrenamiento decreciente con una de validación creciente.
 
 ---
 
----
+## 6. Entrenamiento en dos etapas
 
-## 6. Hiperparámetros y mecanismos de control
+### 6.1 Etapa 1: preentrenamiento multilingüe
 
-| Elemento | Valor | Para qué sirve |
-|---|---|---|
-| Optimizador | **AdamW** | Variante de Adam que adapta la tasa de aprendizaje por parámetro y separa correctamente la regularización de los pesos. |
-| Weight decay | 1e-4 | Penaliza pesos grandes (regularización L2). |
-| Tamaño de lote | 32 | Muestras por actualización. |
-| Learning rate (etapa 1) | 1e-3 | Tamaño del paso de aprendizaje. |
-| Dropout | 0.4 | Apaga al azar el 40 % de las neuronas en entrenamiento para evitar el sobreajuste. |
-| Recorte de gradiente | norma máx. 5.0 | Evita actualizaciones explosivas (importante en redes recurrentes). |
-| Scheduler `ReduceLROnPlateau` | factor 0.5, paciencia 5 (`--lr_patience`) | Si la pérdida de validación no mejora en 5 épocas, reduce el learning rate a la mitad. Debe ser menor que la paciencia del early stopping para que el lr baje antes de detener el entrenamiento. |
-| **Early stopping** | paciencia 15 (`--patience`) | Detiene el entrenamiento si la validación no mejora en 15 épocas seguidas. |
-| Épocas máximas | 100 (etapa 1) · 20 (2a) · 100 (2b) · 100 (línea base) | Tope; normalmente se detiene antes por el early stopping. Siempre se conserva el modelo con menor pérdida de validación, no el de la última época. |
-| Label smoothing | 0.05 (`--smooth`) | Evita que la red se sobreconfíe con pocos datos: las etiquetas objetivo son 0.95 / 0.05 en vez de 1 / 0. Solo en la pérdida de entrenamiento; la de validación es la normal. Eleva el piso de la pérdida de entrenamiento, por eso ya no se parece a corridas anteriores. |
-| Precisión mixta | `--amp` | Cálculo en media precisión en GPU: más rápido, mismos resultados prácticos. |
-| Semilla | `--seed` (inicialización) y `--split_seed` (particiones) | Reproducibilidad. Con `--split_seed` fijo se pueden usar varias semillas sobre las mismas particiones. |
+El objetivo es que la red aprenda, a partir de muchos ejemplos variados, rasgos generales de la voz sintética independientes del idioma. Para cada modelo, se parte de pesos aleatorios y se entrena con la partición multilingüe de entrenamiento, con aumento de canal, SpecAugment y ventanas aleatorias. El resultado (`cnn_pre.pt`, `lstm_pre.pt`) se evalúa en español sin haberlo visto nunca, lo que constituye la condición A.
 
-**Selección del mejor modelo.** En cada época se mide la pérdida en validación y se guarda el modelo **solo si mejora**. Al terminar se recarga el mejor, no el último. Esto protege contra el **sobreajuste** (*overfitting*): cuando la red memoriza el entrenamiento y empeora con datos nuevos, lo que se ve como pérdida de entrenamiento bajando mientras la de validación sube.
+### 6.2 Etapa 2: adaptación al español
 
-**Modos `train` y `eval`.** Durante el entrenamiento, *Dropout* está activo y *BatchNorm* usa estadísticas del lote. Al evaluar se desactiva el dropout y BatchNorm usa estadísticas acumuladas, de modo que las predicciones son deterministas.
+Reentrenar toda la red con unos cientos de audios en español produciría sobreajuste; resulta más eficiente reutilizar lo aprendido y ajustar solo lo necesario. Para ello se reemplaza la capa final `Linear(64→2)` por una nueva con pesos aleatorios, conservando el extractor de características (convoluciones o LSTM). El ajuste procede en dos fases:
+
+| Fase | Parámetros entrenables | Tasa de aprendizaje | Épocas máx. |
+|---|---|---|---|
+| 2a: solo la cabeza (extractor congelado) | CNN 16,578 · LSTM 32,962 | 1×10⁻³ | 20 |
+| 2b: toda la red | CNN 404,898 · LSTM 692,674 | 1×10⁻⁴ | 100 |
+
+La capa nueva produce al inicio gradientes grandes y poco informativos que podrían deteriorar los pesos preentrenados; por ello primero se acomoda la cabeza (2a) y luego se afina toda la red con una tasa diez veces menor (2b). En la fase 2a, las capas `BatchNorm` de la CNN, aunque con pesos congelados, actualizan sus estadísticas con los datos en español, lo que adapta la normalización al nuevo idioma. El resultado (`cnn.pt`, `lstm.pt`) corresponde a la condición B.
 
 ---
 
----
+## 7. Condiciones experimentales y métricas
 
-## 7. Etapa 1: preentrenamiento multilingüe
+### 7.1 Condiciones
 
-**Objetivo.** Que la red aprenda, con muchos ejemplos variados, características generales que separen voz real de sintética, sin depender de un idioma concreto.
-
-**Procedimiento (para cada modelo):**
-
-1. Se crea la red con pesos aleatorios.
-2. Se entrena con la partición multilingüe de entrenamiento (≈ 14,064 audios), con pérdida ponderada, AdamW (lr 1e-3), aumento de canal, SpecAugment y ventanas aleatorias.
-3. Tras cada época se mide la pérdida en la validación multilingüe; se aplican scheduler, early stopping y guardado del mejor modelo.
-4. Resultado: `cnn_pre.pt` / `lstm_pre.pt`.
-
-En este punto se evalúa el modelo en el test en español **sin haberlo visto nunca**. Es la **condición A** (ver sección 9).
-
----
-
-## 8. Etapa 2: adaptación al español (*fine-tuning*)
-
-### 8.1 Idea
-
-Una red ya preentrenada ha aprendido características útiles (en la CNN, filtros que detectan texturas; en la LSTM, patrones temporales). Reaprender todo con solo ≈ 700 audios en español provocaría sobreajuste. Lo eficiente es **reutilizar** lo aprendido y ajustar solo lo necesario.
-
-### 8.2 Reemplazo de la última capa
-
-Se elimina la capa final de clasificación, `Linear(64 → 2)`, y se coloca una nueva con pesos aleatorios (`replace_last_layer`). Todo lo anterior conserva sus pesos preentrenados.
-
-Dos partes de la red:
-
-- **Extractor de características (*backbone*):** convoluciones (CNN) o LSTM, que convierten el espectrograma en un vector de rasgos.
-- **Cabeza de clasificación (*head*):** las dos capas lineales finales, que convierten ese vector en la decisión real/fake.
-
-### 8.3 Dos fases de ajuste
-
-| Fase | Qué se entrena | Parámetros entrenables | Learning rate | Épocas máx. |
-|---|---|---|---|---|
-| **2a** | Solo la **cabeza** (la capa intermedia `Linear→64` y la capa nueva). El extractor queda **congelado**. | CNN: 16,578 · LSTM: 32,962 | 1e-3 | 20 |
-| **2b** | **Toda la red** | CNN: 404,898 · LSTM: 692,674 | 1e-4 | 100 |
-
-**Por qué dos fases.** La capa nueva parte de pesos aleatorios y, al principio, produce gradientes grandes y poco informativos. Si se entrenara toda la red desde el inicio, esos gradientes podrían **dañar** los pesos preentrenados. Primero se deja que la cabeza se acomode (2a) y después se afina todo con un learning rate 10 veces menor (2b), de modo que los ajustes sean pequeños y cuidadosos.
-
-**Detalle técnico.** En la fase 2a las capas `BatchNorm` de la CNN, aunque sus pesos estén congelados, siguen actualizando sus estadísticas internas (media y varianza acumuladas) con los datos en español, porque la red está en modo `train`. En la práctica esto ayuda a adaptar la normalización al nuevo idioma, pero es un comportamiento a tener presente al describirlo.
-
-**Selección.** Igual que en la etapa 1: validación en español, early stopping, y se conserva el mejor modelo. El resultado final es `cnn.pt` y `lstm.pt` (**condición B**).
-
----
-
----
-
-## 9. Condiciones experimentales y evaluación
-
-Para responder la pregunta de investigación se evalúan tres condiciones sobre **los mismos audios de prueba en español** (en cada fold):
+Las tres condiciones se evalúan sobre los mismos audios de prueba de cada fold y responden preguntas distintas:
 
 | Condición | Descripción | Pregunta que responde |
 |---|---|---|
-| **A** · Preentrenado | Solo etapa 1; nunca vio español | ¿Generaliza a otro idioma sin ayuda? |
-| **B** · Preentrenado + afinado | Etapas 1 y 2 | ¿Cuánto mejora al adaptarlo? |
-| **C** · Solo español | Red nueva entrenada únicamente con el español de entrenamiento (línea base) | ¿Aporta algo el preentrenamiento? |
+| **A** | Solo etapa 1; nunca vio español | ¿Generaliza a otro idioma sin adaptación? |
+| **B** | Etapas 1 y 2 | ¿Cuánto mejora al adaptarlo al español? |
+| **C** | Red nueva entrenada solo con el español de entrenamiento | ¿Aporta algo el preentrenamiento? |
 
-Si B supera a C, el preentrenamiento con datos variados aporta conocimiento transferible. Si A es mucho peor que B, hay una brecha de dominio entre idiomas.
+Si B supera a C, el preentrenamiento aporta conocimiento transferible; si A es muy inferior a B, existe una brecha de dominio entre idiomas.
 
-### 9.1 Umbral de decisión
+### 7.2 Umbral y calibración
 
-La red entrega una probabilidad de fake. Por defecto se clasifica como fake si `prob_fake ≥ 0.5`. Además se calcula un **umbral alternativo** que maximiza `TPR − FPR` (estadístico J de Youden) **sobre la validación en español**, nunca sobre la prueba, para no ajustar el resultado final con los datos de evaluación. Se reportan ambos (`test@0.5` y `test@umbral_val`).
+La red entrega una probabilidad de *fake*, y por defecto se clasifica como tal si `prob ≥ 0.5`. Adicionalmente se calcula un umbral que maximiza `TPR − FPR` (índice J de Youden) **sobre la validación**, nunca sobre la prueba, para no ajustar el resultado final con los datos de evaluación. Se reportan ambos (`test@0.5` y `test@umbral_val`).
 
-### 9.2 Métricas
+Para que un "80 % fake" se aproxime a una frecuencia real de acierto del 80 %, a cada modelo se le ajusta una **temperatura** *T* (`softmax(logits / T)`) sobre la validación con aumento de canal, restringida a *T* ≥ 1 (solo se permite suavizar, pues con una validación casi perfecta el ajuste libre exigiría mayor seguridad). El umbral y la temperatura se guardan en `metricas.json` y `modelos.json`.
 
-Con **fake como clase positiva**: VP = fakes detectados, VN = reales aceptados, FP = reales marcados como fake, FN = fakes que pasaron como reales.
+### 7.3 Métricas
 
-| Métrica | Fórmula | Interpretación |
+| Métrica | Fórmula | Información que aporta |
 |---|---|---|
-| Exactitud | (VP + VN) / total | Proporción de aciertos. |
-| Precisión | VP / (VP + FP) | De los audios marcados como fake, cuántos lo eran. |
-| Sensibilidad (recall) | VP / (VP + FN) | De los fake reales, cuántos se detectaron. |
-| F1-score | media armónica de precisión y recall | Equilibrio entre ambas. |
-| Matriz de confusión | conteos VN, FP, FN, VP | Tipo de errores que comete. |
-| Curva ROC y AUC | TPR vs FPR en todos los umbrales | Capacidad de separar clases **independiente del umbral**; 0.5 = azar, 1.0 = perfecto. |
-| Tiempo de procesamiento | ms por audio | Costo computacional de cada modelo. |
+| Exactitud | (VP + VN) / total | Proporción global de aciertos |
+| Precisión | VP / (VP + FP) | De los marcados como fake, cuántos lo eran |
+| Sensibilidad (*recall*) | VP / (VP + FN) | De los fake, cuántos se detectaron |
+| Especificidad | VN / (VN + FP) | De los reales, cuántos se aceptaron |
+| F1 | media armónica de precisión y recall | Equilibrio entre ambas |
+| AUC (ROC) | área bajo TPR vs FPR | Separabilidad independiente del umbral (0.5 = azar) |
+| Matriz de confusión | VN, FP, FN, VP | Tipo de errores |
+| Tiempo | ms por audio | Costo computacional |
 
-El **AUC** es especialmente útil para comparar modelos porque no depende del umbral elegido.
+El AUC es la medida principal de comparación porque no depende del umbral. Los intervalos de confianza al 95 % se estiman por *bootstrap* (1,000 remuestreos) y la diferencia CNN − LSTM mediante *bootstrap* pareado sobre los mismos audios, considerándose demostrable solo si el intervalo no contiene el cero.
 
+### 7.4 Prueba de robustez de canal
 
-### 9.3 Calibración de las probabilidades
-
-Las redes suelen dar probabilidades demasiado extremas. Para que el "80 % fake" de la interfaz se parezca a un 80 % de acierto, a cada modelo se le ajusta una **temperatura** *T* (*temperature scaling*): las probabilidades salen de `softmax(logits / T)`. *T* se ajusta en la validación en español **con otro canal** (el mismo aumento de canal) y solo se permite *T* ≥ 1, es decir, solo **suavizar**: con una validación casi perfecta el ajuste libre pediría más seguridad, lo contrario de lo que se busca. La temperatura queda en `metricas.json` y en `modelos.json`.
-
-### 9.4 Prueba de robustez "con otro canal"
-
-Además de las métricas normales, cada modelo se evalúa sobre el **mismo conjunto de prueba con una perturbación de canal fija por audio** (ruido de fondo, respuesta en frecuencia, ancho de banda). Si el AUC cae mucho respecto al normal, el modelo se apoyaba en la grabación y no en la voz. Se reporta como "AUC otro canal".
+Cada modelo se evalúa además sobre el mismo conjunto de prueba con una perturbación de canal fija por audio. Una caída marcada del AUC indicaría dependencia de la grabación y no de la voz.
 
 ---
 
-## 10. Correcciones tras el diagnóstico (para que los resultados sean confiables)
+## 8. Correcciones metodológicas
 
-El diagnóstico (`diagnostico.py`) mostró problemas que se corrigieron:
+El diagnóstico (`diagnostico.py`) y las pruebas externas revelaron problemas que se corrigieron para que los resultados sean confiables:
 
-| Problema detectado | Corrección | Dónde |
+| Problema detectado | Corrección | Módulo |
 |---|---|---|
-| En el conjunto multilingüe, 53–63 % de cada clip es relleno de ceros sin voz; en español casi no hay. Los recortes al azar caían en relleno puro y la duración del clip se volvía una pista ajena a la voz. | `--relleno repetir`: se recorta el relleno y el contenido con voz se repite hasta llenar la ventana. | `preprocesamiento.py` |
-| Real y fake en español se separaban por el suelo de ruido, el rango dinámico y la forma espectral (condiciones de grabación): un atajo que da ~100 % sin detectar voz sintética. | Aumento de canal (`--canal_prob`) y prueba de robustez "con otro canal". | `preprocesamiento.py`, `train.py` |
-| Entrenamiento e interfaz podían preparar el audio de forma distinta. | Un único módulo, `preprocesamiento.py`, con los parámetros reales del script de generación de los `.npy`; se verifican con `probar_preprocesamiento.py`. | `preprocesamiento.py`, `probar_preprocesamiento.py` |
-| Con ≈ 145 audios de prueba, el margen de error es de ±0.03–0.04 y CNN y LSTM se alternaban como "mejor" con los mismos datos. | Validación cruzada por persona (963 audios probados), intervalos de confianza por bootstrap y comparación CNN − LSTM con bootstrap pareado. | `entrenar_cv.py` |
-| Una persona real y su clon IA podían quedar en lados distintos de la partición: el modelo podría aprender la persona y no la autenticidad. | Partición por persona, con la persona real y su clon siempre juntos. | `grupos_es.py`, `train.py` |
+| Entre 53 % y 63 % de cada clip multilingüe es relleno de ceros; los recortes aleatorios caían en relleno y la duración actuaba como indicio | Relleno `repetir`: se recorta el relleno y se repite el contenido con voz | `preprocesamiento.py` |
+| Real y fake en español se separaban por suelo de ruido, rango dinámico y forma espectral (condiciones de grabación) | Aumento de canal y prueba de robustez | `preprocesamiento.py`, `train.py` |
+| El entrenamiento y la interfaz podían preparar el audio de forma distinta | Módulo único de preprocesamiento, verificado con `probar_preprocesamiento.py` | `preprocesamiento.py` |
+| Con ≈ 145 audios de prueba, el margen de error era de ±0.03–0.04 y los modelos se alternaban como "mejor" | Validación cruzada, intervalos por *bootstrap* y comparación pareada | `entrenar_cv.py` |
+| La persona real y su clon podían quedar en lados distintos de la partición | Partición por hablante con la persona y su clon juntos | `grupos_es.py` |
+| Voces reales con frecuencia de muestreo mayor a la del entrenamiento se clasificaban como sintéticas; se descartó el códec (Opus a 24 kbps no degradó la aceptación) y se confirmó el ancho de banda | Limitación de toda entrada a 16 kHz y conversión de los datos nuevos con la misma banda | `preprocesamiento.py`, `hispaspoof_a_npy.py`, `audios_a_npy.py` |
+| El conjunto original tenía pocas fuentes de audio real y de herramientas de síntesis, lo que permitía aprender la fuente | Ampliación con HISPASpoof, CIEMPIESS, conferencias y otras personas; aumento de canal fuerte; pruebas con herramientas no vistas | `preparar_hispaspoof.py`, `probar_externo.py` |
 
 ---
 
-## 11. Entrenamiento final confiable (`entrenar_cv.py`)
+## 9. Orquestación y archivos generados
 
-`entrenar_cv.py` coordina el entrenamiento final:
+`entrenar_cv.py` coordina el entrenamiento final en tres pasos. Primero ejecuta `train.py --fold k` para cada semilla y partición, entrenando la etapa 1 una sola vez por semilla y reutilizándola en los demás folds (`--pre_dir`). Segundo, agrega las predicciones de los folds y calcula exactitud, F1 y AUC con intervalos, la media y desviación entre semillas y la comparación CNN − LSTM. Tercero, escribe `modelos.json`, con los puntos de control, la temperatura y el umbral de cada modelo; la interfaz promedia los modelos de cada etapa, lo que resulta más estable que uno solo. No se selecciona un "mejor" fold, pues hacerlo según su resultado de prueba invalidaría la honestidad de la métrica. El proceso es reanudable: un fold se considera completo cuando existen todos sus resultados.
 
-1. **Validación cruzada por persona (7 folds)** y **varias semillas** (`--seeds`). Para cada semilla y fold llama a `train.py --fold k`. La etapa 1 (multilingüe) se entrena **una sola vez por semilla** y se reutiliza en los demás folds (`--pre_dir`), porque no depende del español.
-2. **Agregación.** Junta las predicciones de los folds (una por audio), calcula accuracy, F1 y AUC con intervalo de confianza 95 % (bootstrap), media ± desviación entre semillas, el AUC del conjunto de semillas, el AUC "con otro canal" y la comparación CNN − LSTM con bootstrap pareado. Una diferencia solo cuenta si su intervalo no contiene 0.
-3. **Conjunto de modelos.** Escribe `modelos.json` con los checkpoints, su temperatura y su umbral. La interfaz **promedia los modelos de cada etapa**, que es más estable que uno solo. No se escoge un "mejor" fold: elegirlo por su resultado de prueba haría que ese número deje de ser honesto.
-
-Es **reanudable**: un fold se da por completo cuando existen todos sus resultados, y el preentrenamiento solo se reutiliza si terminó (archivo `*_pre.done`). Si se interrumpe, al volver a correr el mismo comando continúa donde se quedó.
-
----
-
-## 12. Archivos que se generan
+Las métricas completas (tablas e imágenes) se generan con `metricas/reporte_completo.py` a partir de las predicciones fuera de muestra.
 
 | Archivo | Contenido |
 |---|---|
-| `resultados_cv/seedS/foldK/cnn.pt`, `lstm.pt` | Modelos finales de ese fold (condición B). |
-| `.../cnn_pre.pt`, `lstm_pre.pt` | Preentrenados (condición A); iguales en todos los folds de una semilla. |
-| `.../cnn_solo_es.pt`, `lstm_solo_es.pt` | Líneas base (condición C). |
-| `.../metricas.json` | Métricas por modelo y condición de ese fold, temperaturas y configuración. |
-| `.../pred_<modelo>_<A, A_todo, B o C>.npy` | Etiquetas y probabilidades de prueba (matriz de registro 4.2). |
-| `.../es_test_idx.npy` | Posición de cada audio de prueba en la lista de 963 audios. |
-| `.../registro_pruebas.csv` | Una fila por audio, modelo y condición: clase real, clasificación, probabilidad, confianza, acierto y tiempo. |
-| `.../roc.png`, `matrices_confusion.png`, `perdidas.png` | Curvas ROC, matrices de confusión y curvas de pérdida de ese fold. |
-| `.../log.txt` | Registro del entrenamiento del fold. |
-| `.../*_pre.done` | Marca de que el preentrenamiento terminó (permite reanudar). |
-| `resultados_cv/resumen_cv.json` | Resumen out-of-fold: métricas, intervalos y comparación CNN − LSTM. |
-| `resultados_cv/modelos.json` | Lista de checkpoints, temperatura y umbral: **lo que carga la interfaz**. |
+| `resultados_v3/seedS/foldK/cnn.pt`, `lstm.pt` | Modelos finales del fold (condición B) |
+| `.../cnn_pre.pt`, `lstm_pre.pt` | Modelos preentrenados (condición A) |
+| `.../cnn_solo_es.pt`, `lstm_solo_es.pt` | Líneas base (condición C) |
+| `.../metricas.json` | Métricas, umbrales, temperaturas y configuración del fold |
+| `.../pred_<modelo>_<condición>.npy` | Etiquetas y probabilidades de prueba |
+| `.../es_test_idx.npy` | Posición de cada audio de prueba en `espanol_v3` |
+| `.../registro_pruebas.csv` | Matriz de registro 4.2: una fila por audio, modelo y condición |
+| `.../log.txt` | Registro del entrenamiento |
+| `resultados_v3/resumen_cv.json` | Resumen fuera de muestra con intervalos |
+| `resultados_v3/modelos.json` | Modelos, umbrales y temperaturas que carga la interfaz |
+| `metricas_v3/` | Tablas y figuras generadas por `reporte_completo.py` |
 
 ---
 
-## 13. Cómo ejecutarlo
+## 10. Ejecución
 
 ```bash
 pip install -r requirements.txt
-python training/verificar_datos.py --multi_dir datos/multilingue --es_dir datos/espanol
-# entrenamiento final (reanudable); una semilla tarda aprox. 2 h en una RTX 4070 portátil
-python training/entrenar_cv.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados_cv --seeds 42 --amp
-# opcional: más semillas
-python training/entrenar_cv.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados_cv --seeds 42 43 44 --amp
-# prueba externa con audios propios (externo/real y externo/fake)
-python probar_externo.py --resultados resultados_cv --dir externo
+python training/verificar_datos.py --multi_dir datos/multilingue --es_dir espanol_v3
+
+# entrenamiento final (reanudable; ≈ 2 h por semilla en una RTX 4070 portátil)
+python training/entrenar_cv.py --multi_dir datos/multilingue --es_dir espanol_v3 \
+       --out resultados_v3 --seeds 42 --amp --canal_fuerte
+
+# semillas adicionales (opcional)
+python training/entrenar_cv.py --multi_dir datos/multilingue --es_dir espanol_v3 \
+       --out resultados_v3 --seeds 42 43 44 --amp --canal_fuerte
+
+# métricas, tablas y figuras
+python metricas/reporte_completo.py --out resultados_v3 --es_dir espanol_v3 --destino metricas_v3
+
+# prueba con audios externos
+python probar_externo.py --resultados resultados_v3 --dir externo_nuevas --detalle
 ```
 
-Un entrenamiento suelto, para pruebas rápidas: `python training/train.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados`.
-
-Estructura de datos esperada:
-
-```
-datos/
-├── multilingue/{real,fake}/**/*.npy
-└── espanol/{real,fake}/*.npy
-```
-
-Se usa GPU automáticamente si está disponible. Los hiperparámetros se pueden cambiar con argumentos de `train.py`, que `entrenar_cv.py` reenvía (`--epochs_ft`, `--canal_prob`, `--smooth`, etc.).
+Se emplea GPU automáticamente si está disponible. Los hiperparámetros pueden modificarse mediante argumentos de `train.py`, que `entrenar_cv.py` reenvía (`--epochs_ft`, `--canal_prob`, `--smooth`, etc.).
 
 ---
 
-## 14. Resultados (resumen; detalle en `RESULTADOS.md`)
+## 11. Resumen de resultados
 
-Entrenamiento final: semilla 42, 7 folds por persona, 963 audios en español probados una vez cada uno (*out-of-fold*), umbral 0.5.
+Evaluación fuera de muestra (semilla 42, 7 folds por hablante, `espanol_v3`):
 
-| Modelo | Etapa | Accuracy | AUC [IC 95 %] | AUC con otro canal |
-|---|---|---|---|---|
-| CNN | A · preentrenado (no vio español) | 0.613 | 0.794 [0.764, 0.825] | 0.759 |
-| CNN | B · preentrenado + afinado | 0.991 | 1.000 [1.000, 1.000] | 0.996 |
-| CNN | C · solo español | 0.999 | 1.000 [1.000, 1.000] | 1.000 |
-| LSTM | A · preentrenado (no vio español) | 0.631 | 0.818 [0.789, 0.846] | 0.721 |
-| LSTM | B · preentrenado + afinado | 0.989 | 1.000 [1.000, 1.000] | 0.993 |
-| LSTM | C · solo español | 0.998 | 1.000 [1.000, 1.000] | 0.999 |
+| Modelo | A · preentrenado | B · preentrenado + ajustado | C · solo español |
+|---|---|---|---|
+| CNN (AUC) | 0.825 | 0.998 | 0.998 |
+| LSTM (AUC) | 0.628 | 0.973 | 0.989 |
 
-Diferencia de AUC CNN − LSTM (bootstrap pareado): A **−0.024** [−0.056, +0.009]; B y C 0.000. **No hay diferencia demostrable entre los dos modelos.**
-
-**Lectura.**
-1. Con voces en español que no vio, el modelo preentrenado separa real de fake con AUC ≈ 0.8: es la medida más honesta de generalización a otro idioma.
-2. Dentro del español, B y C llegan a ≈ 100 % incluso con personas nuevas y con otro canal.
-3. C iguala a B, así que con estos datos **no se puede afirmar que el preentrenamiento aporte** en español (efecto de techo).
-4. El 100 % no demuestra que el modelo detecte deepfakes en general: puede reflejar las huellas de las pocas herramientas de voz del conjunto, o una pista que el aumento de canal no cubre. Solo una prueba externa (`probar_externo.py`) con otras herramientas de voz y grabaciones propias distingue ambas explicaciones.
+La CNN supera de forma demostrable a la LSTM en las tres condiciones (diferencia de AUC de +0.198, +0.025 y +0.009). La condición C iguala o supera a la B, por lo que el preentrenamiento multilingüe no aporta mejora medible en español. Con herramientas de síntesis no vistas (fish-speech y XTTS v1), la CNN alcanza una exactitud de 0.935 (B) y 0.930 (C), y la LSTM de 0.825 y 0.820. El análisis completo se encuentra en [`RESULTADOS.md`](RESULTADOS.md).
 
 ---
 
-## 15. Limitaciones a tener presentes
+## 12. Limitaciones
 
-- **Pocas herramientas de voz.** Los falsos en español provienen, según los nombres de archivo, de clones de 21 personas, probablemente hechos con pocas herramientas. El modelo solo conoce los métodos de generación presentes en los datos; con técnicas nuevas el desempeño puede caer hacia lo que mide la condición A (AUC ≈ 0.8).
-- **Posibles atajos no cubiertos.** El aumento de canal solo varía ruido de fondo, respuesta en frecuencia y ancho de banda. Pausas, ritmo, duración, códec o el contenido leído (los reales son cuentos) no se controlan.
-- **Pocas personas por fold.** Con 3 a 4 personas de prueba por fold, las cifras de un fold son muy variables; por eso se reportan los 7 juntos.
-- **Una sola semilla** en el resultado actual: no se mide la variación entre entrenamientos. Ver `--seeds`.
-- **Umbral.** En la etapa A el accuracy a 0.5 es bajo aunque el AUC sea ≈ 0.8: el umbral y la temperatura calibrados en validación corrigen el sesgo en la interfaz.
-- **Probabilidades.** Aun calibradas, los porcentajes de la interfaz son la confianza de los modelos, no una certeza.
-- **Coherencia con la interfaz.** El preprocesamiento debe ser idéntico al del entrenamiento; por eso vive en un solo módulo.
-- **Sin prueba externa todavía.** Pendiente de realizar con audios propios y otras herramientas de voz.
-
----
-
-## 16. Glosario
-
-- **Época:** una pasada completa por los datos de entrenamiento.
-- **Lote (*batch*):** grupo de muestras procesadas juntas en cada actualización.
-- **Logit:** salida cruda de la red antes de convertirla en probabilidad.
-- **Softmax:** función que convierte logits en probabilidades que suman 1.
-- **Sobreajuste:** el modelo memoriza el entrenamiento y generaliza mal.
-- **Regularización:** técnicas (dropout, weight decay, aumento de datos) que reducen el sobreajuste.
-- **Backbone / head:** extractor de características / capas finales de clasificación.
-- **Congelar capas:** impedir que sus pesos cambien durante el entrenamiento.
-- **Transfer learning / fine-tuning:** reutilizar un modelo preentrenado y adaptarlo a una tarea o dominio nuevo.
-- **Línea base (*baseline*):** modelo de referencia contra el que se compara.
-- **AUC:** área bajo la curva ROC; mide la separabilidad de las clases sin depender del umbral.
-- **Fold:** una de las 7 rondas de la validación cruzada; en cada una, un grupo distinto de personas se reserva para la prueba.
-- **Out-of-fold:** predicción de un audio hecha por un modelo que no lo vio ni vio a su hablante.
-- **Bootstrap:** remuestreo con reemplazo de los audios para estimar un intervalo de confianza.
-- **Calibración / temperatura:** ajuste de las probabilidades para que reflejen mejor la frecuencia real de acierto.
-- **Aumento de canal:** perturbaciones aleatorias de ruido de fondo, respuesta en frecuencia y ancho de banda durante el entrenamiento.
-- **Atajo (*shortcut learning*):** pista fácil que correlaciona con la etiqueta en los datos pero no es lo que se quiere detectar (p. ej., cómo se grabó).
+- **Canal de teléfono.** Con notas de voz de WhatsApp se aceptan como reales cerca del 62 % (CNN y LSTM en C); el umbral requiere recalibración con un conjunto independiente de ese canal.
+- **Muestra propia reducida.** Las grabaciones propias son decenas de fragmentos y el resultado depende del decodificador empleado.
+- **Herramientas de síntesis.** El modelo solo conoce los métodos presentes en el entrenamiento; XTTS v1 fue la más difícil de detectar (78–82 %).
+- **Hablantes compartidos en HISPASpoof** entre sus particiones originales.
+- **Atajos no controlados.** El aumento de canal varía ruido, respuesta en frecuencia y ancho de banda; pausas, ritmo, duración y contenido léxico no se controlan.
+- **Una sola semilla** en el resultado actual (`--seeds`).
+- **Probabilidades.** Aun calibradas, expresan la confianza del modelo y no una certeza.
+- **Coherencia con la interfaz.** El preprocesamiento debe ser idéntico al del entrenamiento, incluida la banda de 16 kHz.

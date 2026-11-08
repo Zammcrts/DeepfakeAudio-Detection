@@ -1,123 +1,191 @@
-# Resultados del entrenamiento
+# Resultados experimentales
 
-Evaluación de modelos CNN y LSTM mediante representaciones espectrales para la detección de audios sintéticos.
+En este documento se reportan las métricas obtenidas en la evaluación de los modelos CNN y LSTM, su incertidumbre y las conclusiones que sustentan. El procedimiento se describe en [`ENTRENAMIENTO.md`](ENTRENAMIENTO.md); las tablas y figuras completas se generan con `metricas/reporte_completo.py` (carpeta `metricas_v3/`).
 
-Este documento reporta lo que se midió, con sus márgenes de error, y **lo que se puede y no se puede afirmar** con esos números. El método está en `ENTRENAMIENTO.md`.
+## Contenido
+
+1. [Resumen](#1-resumen)
+2. [Diseño de la evaluación](#2-diseño-de-la-evaluación)
+3. [Validación cruzada por hablante](#3-validación-cruzada-por-hablante)
+4. [Acierto por fuente de audio](#4-acierto-por-fuente-de-audio)
+5. [Pruebas externas](#5-pruebas-externas)
+6. [Sesgo de ancho de banda](#6-sesgo-de-ancho-de-banda)
+7. [Evolución del método](#7-evolución-del-método)
+8. [Discusión](#8-discusión)
+9. [Limitaciones](#9-limitaciones)
+10. [Conclusiones](#10-conclusiones)
+11. [Reproducción](#11-reproducción)
 
 ---
 
 ## 1. Resumen
 
-- Se entrenaron una **CNN** y una **LSTM** con mel-espectrogramas, en dos etapas (preentrenamiento con 16,546 audios multilingües y adaptación con 963 audios en español) y se evaluaron con **validación cruzada por persona**: 21 personas (cada una con su clon de IA), 7 folds de 3 personas. Cada audio en español fue probado una vez por modelos que no vieron a su hablante.
-- **Generalización a otro idioma** (modelo preentrenado que nunca vio español): AUC **0.79** (CNN) y **0.82** (LSTM).
-- **Dentro del español** (preentrenado y afinado, o entrenado solo con español): AUC **1.000** y accuracy **0.99–1.00**, incluso con personas nuevas y con perturbaciones de canal.
-- **CNN y LSTM no se distinguen** de forma demostrable (diferencia de AUC en la condición A: −0.024, IC 95 % [−0.056, +0.009]).
-- **El preentrenamiento no mostró beneficio** en español: la línea base entrenada solo con español obtiene lo mismo que el modelo preentrenado y afinado.
-- **El 100 % dentro del español no debe presentarse como capacidad general de detección.** Falta la prueba con audios y herramientas de voz externas (sección 7).
+El propósito de la evaluación fue comparar una red convolucional (CNN) y una recurrente (LSTM) en la detección de audio sintético en español, bajo tres condiciones: **A** (preentrenamiento multilingüe sin ver español), **B** (preentrenamiento y ajuste con español) y **C** (entrenamiento únicamente con español, como línea base). Los hallazgos principales son los siguientes:
+
+- Con evaluación fuera de muestra agrupada por hablante, el AUC de la CNN fue 0.825 (A), 0.998 (B) y 0.998 (C); el de la LSTM, 0.628, 0.973 y 0.989.
+- La CNN superó a la LSTM de forma demostrable en las tres condiciones.
+- El preentrenamiento multilingüe no produjo una mejora medible en español.
+- Ante herramientas de síntesis ausentes del entrenamiento (fish-speech y XTTS v1), la CNN alcanzó una exactitud de 0.93 y la LSTM de 0.82.
+- Se identificó y corrigió un sesgo de ancho de banda que provocaba que las voces reales de teléfono se clasificaran como sintéticas.
+- Persiste una limitación en el canal de teléfono: cerca del 62 % de las voces reales propias se aceptan como tales.
 
 ---
 
-## 2. Configuración
+## 2. Diseño de la evaluación
 
-| Elemento | Valor |
-|---|---|
-| Datos multilingües | 9,569 reales + 6,977 fake (16,546), tras quitar 246 duplicados |
-| Datos en español | 502 reales + 461 fake (963), 21 personas; cada persona tiene un clon de IA |
-| Espectrograma | 128 mels × 431 frames (≈ 10 s), dB absolutos; sr 22,050, n_fft 2048, hop 512 |
-| Validación | cruzada por persona, 7 folds (3 a 4 personas de prueba por fold); persona real y clon siempre juntos |
-| Tamaño por fold | entrenamiento ≈ 690–710, validación ≈ 126–129, prueba ≈ 129–144 audios |
-| CNN / LSTM | ≈ 404,900 / ≈ 692,700 parámetros |
-| Optimización | AdamW, lote 32, lr 1e-3 (etapa 1) y 1e-4 (afinado completo), early stopping (paciencia 15), `ReduceLROnPlateau` |
-| Regularización | dropout 0.4, weight decay 1e-4, label smoothing 0.05, SpecAugment, aumento de canal (prob. 0.8) |
-| Semillas | 1 (42). Pendiente: 43 y 44 para medir la variación entre entrenamientos |
-| Intervalos de confianza | bootstrap, 1,000 remuestreos, 95 % |
+### 2.1 Datos
 
-**Condiciones evaluadas:** **A** = preentrenado, nunca vio español · **B** = preentrenado + afinado con español · **C** = entrenado solo con español (línea base).
+El **conjunto multilingüe** (9,569 audios reales y 6,977 sintéticos) se empleó solo en el preentrenamiento. El **conjunto en español ampliado** integró el conjunto original (963 audios, 21 hablantes con su clon sintético), una muestra de HISPASpoof (ElevenLabs, F5-TTS, XTTS v2 y YourTTS), voces reales de CIEMPIESS y voces reales de 13 fuentes de conferencias y 14 personas adicionales. La diversidad de fuentes reales y sintéticas pretende que los modelos discriminen la autenticidad y no las condiciones de grabación. La composición exacta por fuente se encuentra en `metricas_v3/tablas/acierto_por_fuente.md`.
+
+### 2.2 Configuración
+
+Los espectrogramas tienen 128 bandas mel × 431 frames (≈ 10 s) a 22,050 Hz, tras limitar la entrada a 16 kHz. Los modelos (CNN ≈ 404,900 y LSTM ≈ 692,700 parámetros) se entrenaron con AdamW, lote de 32, *early stopping*, *dropout*, *label smoothing*, SpecAugment y aumento de canal fuerte, con una sola semilla (42).
+
+### 2.3 Protocolo
+
+La evaluación principal fue una **validación cruzada de 7 particiones agrupada por hablante**, de modo que cada audio se clasificó con modelos que no vieron a su hablante; el umbral y la calibración se determinaron únicamente con la validación. Las diferencias entre modelos se estimaron con *bootstrap* pareado (1,000 remuestreos, nivel 95 %) y se consideraron demostrables solo cuando el intervalo excluyó el cero. Como complemento se usaron tres pruebas externas (sección 5) con conjuntos que no participaron en el entrenamiento. La clase positiva es *sintético*.
 
 ---
 
-## 3. Resultados principales (fuera de muestra, 963 audios)
+## 3. Validación cruzada por hablante
 
-Umbral de decisión 0.5. "AUC con otro canal" es el AUC del mismo conjunto de prueba con una perturbación fija de ruido de fondo, respuesta en frecuencia y ancho de banda.
+### 3.1 Desempeño por condición
 
-| Modelo | Condición | Accuracy | AUC [IC 95 %] | AUC con otro canal |
+| Modelo | Condición | AUC fuera de muestra |
+|---|---|---|
+| CNN | A · preentrenado, sin ver español | 0.825 |
+| CNN | B · preentrenado + ajustado | 0.998 |
+| CNN | C · solo español | 0.998 |
+| LSTM | A · preentrenado, sin ver español | 0.628 |
+| LSTM | B · preentrenado + ajustado | 0.973 |
+| LSTM | C · solo español | 0.989 |
+
+La condición A mide la transferencia entre idiomas: la CNN conserva una capacidad discriminativa moderada, mientras que la LSTM se acerca al azar. Tras incorporar datos en español (B y C), ambos modelos superan 0.97 de AUC. La exactitud, precisión, sensibilidad, especificidad, F1, matrices de confusión, intervalos de confianza y dispersión entre folds se reportan en `metricas_v3/tablas/` (`metricas_completas.md`, `metricas_por_fold.csv`, `dispersion_folds.md`) y en `figuras/01_matrices_confusion.png`.
+
+### 3.2 Comparación entre arquitecturas
+
+| Condición | Diferencia de AUC (CNN − LSTM) | Conclusión |
+|---|---|---|
+| A | +0.198 | CNN superior |
+| B | +0.025 | CNN superior |
+| C | +0.009 | CNN superior |
+
+La ventaja de la CNN es amplia cuando el modelo no vio español y se reduce, sin desaparecer, tras el ajuste o el entrenamiento con español.
+
+---
+
+## 4. Acierto por fuente de audio
+
+El desempeño agregado puede ocultar fuentes con comportamiento deficiente. Por ello se desglosó el acierto (umbral 0.5, evaluación fuera de muestra) según el origen del audio. Los valores corresponden a la CNN en las condiciones B y C.
+
+| Fuente | CNN B | CNN C |
+|---|---|---|
+| Real · CIEMPIESS | 100 % | 100 % |
+| Real · HISPASpoof (natural) | 98 % | 98 % |
+| Real · conferencias | 98 % | 96 % |
+| Real · otras personas | 88 % | 86 % |
+| Sintético · conjunto original | 100 % | 100 % |
+| Sintético · HISPASpoof, por herramienta | 93–99 % | 93–99 % |
+
+La condición A detecta solo entre 12 % y 40 % de los sintéticos de la mayoría de las herramientas de HISPASpoof, lo que indica que el preentrenamiento no transfiere a estas voces. La fuente real con menor acierto fue la de *otras personas*, cuyas grabaciones son las más heterogéneas, lo que sugiere que la variabilidad del canal de captura es el factor más difícil de cubrir.
+
+---
+
+## 5. Pruebas externas
+
+Las pruebas externas evalúan la generalización en escenarios que la validación cruzada interna no cubre.
+
+### 5.1 Herramientas de síntesis no vistas
+
+Se evaluaron audios generados con fish-speech y XTTS v1, ausentes del entrenamiento, junto con voces reales naturales.
+
+| Modelo | Condición | Exactitud | AUC |
+|---|---|---|---|
+| CNN | B | 0.935 | 0.996 |
+| CNN | C | 0.930 | 0.993 |
+| CNN | A | 0.680 | 0.800 |
+| LSTM | B | 0.825 | 0.889 |
+| LSTM | C | 0.820 | 0.921 |
+| LSTM | A | 0.455 | 0.413 |
+
+La CNN detectó el 92 % (B) y el 94 % (C) de los audios de fish-speech, y el 82 % (B) y el 78 % (C) de los de XTTS v1. La LSTM en la condición A obtuvo un AUC inferior a 0.5, es decir, sin capacidad discriminativa en este conjunto.
+
+### 5.2 Muestra de HISPASpoof (partición de validación)
+
+La exactitud fue 1.000 (CNN C), 0.980 (CNN B), 0.975 (LSTM C) y 0.960 (LSTM B); en la condición A, 0.735 (CNN) y 0.51 (LSTM). Estos valores deben interpretarse con reserva, ya que HISPASpoof comparte 24 hablantes entre sus particiones y la prueba no es independiente por hablante.
+
+### 5.3 Notas de voz grabadas con teléfono
+
+Se evaluaron notas de voz de WhatsApp grabadas por las autoras, tras aplicar la limitación de banda a 16 kHz.
+
+| Modelo | Condición | Exactitud | AUC | Reales aceptados |
 |---|---|---|---|---|
-| CNN | A · preentrenado | 0.613 | 0.794 [0.764, 0.825] | 0.759 |
-| CNN | B · preentrenado + afinado | 0.991 | 1.000 [1.000, 1.000] | 0.996 |
-| CNN | C · solo español | 0.999 | 1.000 [1.000, 1.000] | 1.000 |
-| LSTM | A · preentrenado | 0.631 | 0.818 [0.789, 0.846] | 0.721 |
-| LSTM | B · preentrenado + afinado | 0.989 | 1.000 [1.000, 1.000] | 0.993 |
-| LSTM | C · solo español | 0.998 | 1.000 [1.000, 1.000] | 0.999 |
+| CNN | B | 0.732 | 0.910 | 42 % |
+| CNN | C | 0.821 | 0.967 | 62 % |
+| LSTM | B | 0.696 | 0.917 | 38 % |
+| LSTM | C | 0.804 | 0.945 | 62 % |
 
-(Con una sola semilla, la desviación entre semillas no está definida. Los valores de F1, intervalos de accuracy y matrices de confusión por fold están en `resultados_cv/resumen_cv.json` y en cada carpeta de fold.)
-
-### Comparación CNN − LSTM (AUC, bootstrap pareado)
-
-| Condición | Diferencia | IC 95 % | Conclusión |
-|---|---|---|---|
-| A | −0.024 | [−0.056, +0.009] | sin diferencia demostrable |
-| B | 0.000 | [0.000, 0.000] | empate (ambos en el techo) |
-| C | 0.000 | [0.000, 0.000] | empate (ambos en el techo) |
+Un AUC elevado con una baja aceptación de reales indica que los modelos separan las clases, pero que el umbral de 0.5 no es adecuado para este canal. Al convertir previamente las notas a WAV de 16 kHz con ffmpeg, la LSTM C aceptó el 88 % de los reales (exactitud 0.929) y la CNN C alcanzó 0.839 de exactitud, lo que evidencia sensibilidad al decodificador y al remuestreador. Dado que la muestra comprende decenas de fragmentos, estas cifras son indicativas.
 
 ---
 
-## 4. Interpretación
+## 6. Sesgo de ancho de banda
 
-**4.1 Condición A: generalización a otro idioma.** Es la única condición en que el modelo no vio español durante el entrenamiento, así que su AUC (≈ 0.8) es la medida más directa de qué tanto transfiere lo aprendido de un idioma a otro. Separa real de fake bastante mejor que el azar (0.5), pero lejos de perfecto. Con el umbral 0.5, el accuracy es bajo (0.61–0.63): el modelo tiende a clasificar la mayoría como real. El AUC indica que la separación existe; en la interfaz se compensa con el umbral y la temperatura que cada modelo calibra en validación.
+Las voces reales de teléfono eran clasificadas como sintéticas, por lo que se contrastaron dos hipótesis. La primera atribuía el fenómeno a la compresión con pérdidas (códec Opus); se descartó, pues voces reales de HISPASpoof comprimidas con Opus a 24 kbps siguieron aceptándose (CNN B 88 %, CNN C 86 %, LSTM B 81 %, LSTM C 92 %). La segunda lo atribuía al ancho de banda: los datos de entrenamiento estaban limitados a unos 16 kHz, mientras que los mp3 de WhatsApp conservan contenido por encima de 8 kHz, que el modelo interpretaba como evidencia de audio no real. Esta hipótesis se confirmó.
 
-**4.2 Condiciones B y C: dentro del español.** Ambas alcanzan AUC 1.000 y accuracy de 0.99 a 1.00 con personas que no vieron. La perturbación de canal casi no las afecta (AUC 0.99–1.00). Esto descarta que dependan de ruido de fondo, respuesta en frecuencia o ancho de banda, pero **no** descarta otras explicaciones:
-- Los falsos en español provienen de pocas herramientas de voz, con huellas muy marcadas que un modelo aprende con unos 700 ejemplos.
-- Hay otra pista que el aumento de canal no cubre (pausas, ritmo, duración, códec o el texto leído: los reales son cuentos).
-
-**4.3 El preentrenamiento no aportó en español.** C (solo español, sin preentrenar) iguala a B. Como ambos están en el techo, no hay margen para ver una mejora; con este conjunto no se puede ni confirmar ni descartar que el preentrenamiento ayude. El único indicio es que A, sin ver español, ya separa con AUC ≈ 0.8.
-
-**4.4 CNN contra LSTM.** No hay diferencia demostrable. En una corrida previa con una sola partición, cada modelo "ganó" una vez con los mismos datos; ese comportamiento es la variación entre entrenamientos, no una superioridad real.
+La corrección consistió en limitar toda entrada a 16 kHz (`BANDA = 16000` en `preprocesamiento.py`) y convertir los conjuntos nuevos con la misma banda. La aceptación de reales propios pasó de 4–38 % a 38–62 % según el modelo, con un máximo de 88 %. Un aumento de canal más intenso y una mayor diversidad de reales no bastaron por sí solos para resolver el problema.
 
 ---
 
-## 5. Evolución de los resultados (por qué se cambió el método)
+## 7. Evolución del método
 
-| Versión | Cambio | AUC de A sobre los 963 audios (CNN / LSTM) | Lectura |
-|---|---|---|---|
-| Inicial | ventanas de 128 frames, relleno sin tratar | 0.91 / 0.90 | Los clips multilingües tienen 53–63 % de relleno de ceros; se cae en ventanas sin voz. |
-| + clip completo y recorte de relleno | `--relleno repetir`, 431 frames | 0.98–1.00 / 0.98–1.00 (dos corridas) | AUC muy alto y B/C perfectos; el diagnóstico mostró que real y fake en español se separaban por el ruido de fondo y la forma espectral. |
-| + aumento de canal y label smoothing (**final**) | `--canal_prob 0.8`, `--smooth 0.05` | **0.79 / 0.82** | Quitar la pista de la grabación bajó el AUC de A: lo que queda es más cercano a lo que transfiere de la voz. |
+| Versión | Cambio principal | Efecto observado |
+|---|---|---|
+| v1 | Entrenamiento con el conjunto original (21 hablantes) y aumento de canal moderado | AUC interno ≈ 1.000 y AUC de A ≈ 0.8; sin prueba externa |
+| v2 | Mismos datos; pruebas con notas de voz propias | Reales propios aceptados en 4–38 %: el desempeño interno no se trasladaba a otros canales |
+| v3 | Conjunto ampliado, aumento de canal fuerte y banda unificada de 16 kHz | AUC interno de 0.97–0.998 en B y C, generalización a herramientas no vistas (CNN ≈ 0.93) y mejora en reales propios |
 
-La caída de A de ≈ 0.98 a ≈ 0.80 es coherente con que antes el modelo se apoyaba parcialmente en las condiciones de grabación. Es una inferencia, no una prueba: no se corrió una versión idéntica que cambie solo una cosa a la vez.
-
----
-
-## 6. Lo que se puede y no se puede afirmar
-
-**Se puede afirmar:**
-- Con voces en español que no vio (y con personas de prueba nuevas), el modelo preentrenado separa real de fake con AUC ≈ 0.8 (0.79 CNN, 0.82 LSTM).
-- Dentro de los datos en español, un modelo entrenado con otras personas distingue real de fake con AUC ≈ 1.000 y accuracy ≈ 0.99, y eso no depende de ruido de fondo, respuesta en frecuencia ni ancho de banda.
-- CNN y LSTM rinden igual con estos datos (diferencia no demostrable).
-
-**No se puede afirmar:**
-- Que el sistema detecte deepfakes de herramientas de voz que no están en el conjunto de datos.
-- Que funcione con grabaciones de usuarios reales (micrófonos, compresión, ruido) sin probarlo.
-- Que el preentrenamiento mejore el resultado en español.
-- Que un modelo sea mejor que el otro.
+La reducción del AUC interno entre v1 y v3 es esperable y deseable: el conjunto ampliado elimina atajos asociados a la grabación del conjunto original, de modo que la medición refleja con mayor fidelidad la capacidad real de detección.
 
 ---
 
-## 7. Pendiente (necesario para llamar "confiable" al sistema)
+## 8. Discusión
 
-1. **Prueba externa** con `probar_externo.py`: 20–30 voces reales grabadas por el equipo o de fuentes ajenas al conjunto de datos, y 20–30 voces falsas hechas con **otras herramientas** de síntesis, en español.
-   - Si B y C aciertan: generalizan mejor de lo que indica A.
-   - Si B y C fallan y A se mantiene ≈ 0.8: B y C aprendieron las herramientas del conjunto; la interfaz debe presentarlos con esa advertencia.
-2. **Repetir con 2 semillas más** (`--seeds 42 43 44`) para reportar media ± desviación y comparar CNN y LSTM con mayor certeza.
-3. **Documentar el origen** de los audios reales y de los falsos en español (herramientas de síntesis, textos, condiciones de grabación).
+**Superioridad de la CNN.** La CNN superó a la LSTM en todas las condiciones y pruebas externas. Una explicación plausible es que los artefactos de síntesis se manifiestan como patrones locales en tiempo y frecuencia, que las convoluciones capturan directamente, mientras que la LSTM procesa cada frame como un vector y depende más de la dinámica temporal. Esta interpretación no se verificó de forma aislada.
 
-*Resultado de la prueba externa:* _(por completar)_
+**Papel del preentrenamiento.** El preentrenamiento multilingüe generaliza de forma moderada en la CNN y deficiente en la LSTM, y tras el ajuste no supera al entrenamiento solo con español. Con el volumen de datos disponible no se observa ventaja de transferir desde otros idiomas.
+
+**Validez de la medición.** La evaluación por hablante evita que el modelo se limite a reconocer personas, y las pruebas con herramientas no vistas y con grabaciones propias aportan evidencia de generalización que la validación interna no puede ofrecer por sí sola.
 
 ---
 
-## 8. Cómo reproducir
+## 9. Limitaciones
+
+- **Canal de teléfono.** Los reales grabados con teléfono se aceptan en torno al 62 % (CNN y LSTM en C), probablemente por la escasez de ejemplos de ese canal en el entrenamiento.
+- **Muestra propia reducida.** Las pruebas con notas de voz comprenden decenas de fragmentos; la variación entre decodificadores muestra que la cifra es inestable.
+- **Hablantes compartidos en HISPASpoof** entre sus particiones, por lo que las cifras de esa fuente no son independientes por hablante.
+- **Herramientas de síntesis.** El modelo solo conoce las herramientas presentes en el entrenamiento; XTTS v1 fue la menos detectada (78–82 %).
+- **Una sola semilla,** por lo que no se estima la variación entre entrenamientos.
+- **Probabilidades.** Aun calibradas, constituyen una medida de confianza y no una certeza.
+
+---
+
+## 10. Conclusiones
+
+1. Los mel-espectrogramas permiten detectar audio sintético en español con AUC fuera de muestra de 0.97–0.998 al entrenar con datos en español (condiciones B y C).
+2. La CNN es superior a la LSTM en todas las condiciones, con diferencias estadísticamente demostrables.
+3. El preentrenamiento multilingüe no aporta una mejora medible respecto del entrenamiento solo con español; la configuración recomendada es la CNN en la condición C (o B).
+4. La generalización a herramientas de síntesis no vistas es razonable en la CNN (≈ 93 % de exactitud) y claramente inferior en la LSTM (≈ 82 %).
+5. El ancho de banda de entrada es un factor crítico: unificarlo en 16 kHz es necesario para audios de teléfono.
+6. Antes de un uso en condiciones reales se recomienda recalibrar el umbral con un conjunto independiente de notas de voz y repetir el entrenamiento con semillas adicionales (`--seeds 42 43 44`).
+
+---
+
+## 11. Reproducción
 
 ```bash
-python training/entrenar_cv.py --multi_dir datos/multilingue --es_dir datos/espanol --out resultados_cv --seeds 42 --amp
+python training/entrenar_cv.py --multi_dir datos/multilingue --es_dir espanol_v3 \
+       --out resultados_v3 --seeds 42 --amp --canal_fuerte
+python metricas/reporte_completo.py --out resultados_v3 --es_dir espanol_v3 --destino metricas_v3
+python probar_externo.py --resultados resultados_v3 --dir externo_nuevas --detalle
 ```
-
-Resultados en `resultados_cv/resumen_cv.json` (métricas, intervalos, comparación CNN − LSTM) y `resultados_cv/modelos.json` (modelos que usa la interfaz). Tiempo aproximado: 2 h por semilla en una RTX 4070 portátil.

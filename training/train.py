@@ -52,11 +52,11 @@ class SpecDataset(Dataset):
     """Carga .npy, lo acondiciona a n_frames y normaliza por muestra con preprocesamiento.py,
     el mismo código que usa la interfaz en inferencia."""
 
-    def __init__(self, paths, labels, n_frames, train=False, relleno="repetir", canal=0.0, estres=False):
+    def __init__(self, paths, labels, n_frames, train=False, relleno="repetir", canal=0.0, estres=False, fuerte=False):
         """canal: probabilidad de perturbar el 'canal' en entrenamiento (ver preprocesamiento.perturbar_canal).
         estres: aplica SIEMPRE una perturbación fija por audio (prueba de robustez, sin aleatoriedad entre corridas)."""
         self.paths, self.labels, self.n_frames, self.train, self.relleno = paths, labels, n_frames, train, relleno
-        self.canal, self.estres = canal, estres
+        self.canal, self.estres, self.fuerte = canal, estres, fuerte
 
     def __len__(self):
         return len(self.paths)
@@ -67,7 +67,7 @@ class SpecDataset(Dataset):
         if self.estres:
             s = perturbar_canal(s, np.random.default_rng(1000 + i), p=1.0)
         elif self.train and self.canal > 0:
-            s = perturbar_canal(s, None, p=self.canal)
+            s = perturbar_canal(s, None, p=self.canal, fuerte=self.fuerte)
         s = normalizar(s)
         if self.train:  # SpecAugment simple
             f = np.random.randint(0, 12); f0 = np.random.randint(0, s.shape[0] - f)
@@ -318,6 +318,9 @@ def main():
     ap.add_argument("--canal_prob", type=float, default=0.8,
                     help="probabilidad de perturbar el canal (ruido de fondo, respuesta en frecuencia, ancho de banda) "
                          "en cada muestra de entrenamiento. 0 = sin aumento (reproduce el comportamiento anterior)")
+    ap.add_argument("--canal_fuerte", action="store_true",
+                    help="aumento de canal más amplio (inclinación ±15 dB, paso bajo en 60 %% de las muestras): simula "
+                         "micrófonos de celular y códecs. Solo cambia el entrenamiento")
     ap.add_argument("--por_grupo", action="store_true",
                     help="separa el español por hablante/voz (ver grupos_es.py): evaluación más exigente")
     ap.add_argument("--n_boot", type=int, default=1000, help="remuestreos bootstrap para los IC 95 %% (0 = sin IC)")
@@ -353,7 +356,7 @@ def main():
     print(f"multi: train={len(mtr_p)} val={len(mva_p)} | español: train={len(etr_p)} val={len(eva_p)} test={len(ete_p)}"
           f" | n_mels={n_mels} frames={a.n_frames} | {device}")
 
-    mk = lambda p, l, tr, x=False: DataLoader(SpecDataset(p, l, a.n_frames, tr, a.relleno, a.canal_prob if tr else 0.0, x),
+    mk = lambda p, l, tr, x=False: DataLoader(SpecDataset(p, l, a.n_frames, tr, a.relleno, a.canal_prob if tr else 0.0, x, a.canal_fuerte and tr),
                                               batch_size=a.batch, shuffle=tr,
                                      num_workers=a.workers, persistent_workers=a.workers > 0,
                                      pin_memory=(device == "cuda"))
